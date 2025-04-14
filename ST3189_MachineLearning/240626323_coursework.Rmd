@@ -1,0 +1,1897 @@
+---
+title: "Steam Data Coursework"
+author: "StevenSio"
+date: "2024-12-05"
+output:
+  pdf_document: default
+  html_document:
+    df_print: kable
+editor_options:
+  markdown:
+    wrap: 72
+---
+### Data source
+Bustos Roman, M. (2022). Steam Games Dataset [Data set]. Kaggle. https://doi.org/10.34740/KAGGLE/DS/2109585
+
+
+### Load Libraries
+
+```{r, include=FALSE}
+library(jsonlite)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(GGally)
+library(lubridate)
+library(rgl)
+library(reshape2)
+library(caret)
+library(glmnet)
+library(MASS)
+library(leaps)
+library(corrplot)
+library(dendextend)
+library(ggdendro)
+library(skimr)
+library(mlr3pipelines)
+library(mlr3learners)
+library(mlr3tuning)
+library(mlr3viz)
+library(mlr3fselect)
+library(mlr3verse)
+library(ranger)
+library(xgboost)
+library(rpart.plot)
+library(jtools)
+```
+
+### Extract data from JSON file
+
+The JSON has a nested structure, where each game's data is in a list
+that is represented by the game id (`appID`).
+
+The `tags` feature contains value that resembles a dictionary/table
+containing tags chosen by users as keys and its tag frequency as value
+for each game, I will create a seperate dataframe for this feature for
+further analysis.
+
+```{r}
+# import raw data and combine them
+
+# Initialize an empty dataframe to store game data
+games_list <- list()
+tags_list <- list()
+
+# Read the JSON dataset
+dataset <- fromJSON("games.json")
+
+# Iterate over each appID in the dataset and store the game data within `appID` into a list
+for (app in names(dataset)) {
+  game <- dataset[[app]]
+  
+  # Collect row data
+  game_info <- data.frame(
+    appID                = app,
+    name                 = coalesce(as.character(game$name), NA),
+    releaseDate          = coalesce(as.Date(game$release_date, format = "%b %d, %Y"), NA),
+    estimatedOwners      = coalesce(as.factor(game$estimated_owners), NA),
+    required_age         = coalesce(as.numeric(game$required_age), 0),
+    price                = coalesce(as.numeric(game$price), 0.0),
+    dlcCount             = coalesce(as.numeric(game$dlc_count), 0),
+    languages            = coalesce(paste(as.character(game$supported_languages), collapse = ", "), NA),
+    fullAudioLanguages   = coalesce(paste(as.character(game$full_audio_languages), collapse = ", "), NA),
+    positive             = coalesce(as.numeric(game$positive), 0),
+    negative             = coalesce(as.numeric(game$negative), 0),
+    achievements         = coalesce(as.numeric(game$achievements), 0),
+    recommendations      = coalesce(as.numeric(game$recommendations), 0),
+    averagePlaytime      = coalesce(as.numeric(game$average_playtime_forever), 0),
+    medianPlaytime       = coalesce(as.numeric(game$median_playtime_forever), 0),
+    developers           = coalesce(paste(as.character(game$developers), collapse = ", "), NA),
+    publishers           = coalesce(paste(as.character(game$publishers), collapse = ", "), NA),
+    genres               = coalesce(paste(as.character(game$genres), collapse = ", "), NA)
+  )
+  
+  # some other excluded features
+    #supportWindows       = coalesce(as.logical(game$windows), FALSE),
+    #supportMac           = coalesce(as.logical(game$mac), FALSE),
+    #supportLinux         = coalesce(as.logical(game$linux), FALSE),
+    #metacriticScore      = coalesce(as.numeric(game$metacritic_score), 0),
+    #userScore            = coalesce(as.numeric(game$user_score), 0),
+  
+  # Append the game info to the games list
+  games_list[[length(games_list) + 1]] <- game_info
+  
+  # Extract tags info into a separate tags dataframe
+  if (!is.null(game$tags) && length(names(game$tags)) > 0 && length(game$tags) > 0)  {
+    tags_info <- data.frame(
+      appID     = app,
+      tag       = names(game$tags),
+      frequency = as.numeric(game$tags),
+      stringsAsFactors = FALSE
+    )
+  } else {  
+    # Return NA for no tags
+    tags_info <- data.frame(
+      appID     = app,
+      tag       = NA,
+      frequency = NA,
+      stringsAsFactors = FALSE
+    )
+  }
+  # append the tags data into the tags list
+  tags_list[[length(tags_list) + 1]] <- tags_info
+}
+
+# combine the lists of rows into a dataframe
+games_df <- do.call(rbind, games_list)
+tags_df <- do.call(rbind, tags_list)
+
+```
+
+`tags_df` is in long format:
+
+```{r}
+head(tags_df)
+```
+
+### Data processing
+
+Since I have seperated the game data set into two dataframes, I will
+perform data cleaning and preprocessing on these dataframes seperately,
+and then keep only the games that remained on both dataframes before
+performing machine learning tasks.
+
+### `games_df` EDA and data cleaning
+```{r}
+games_df <- games_df %>%
+  mutate(across(where(is.character), ~ gsub("^\\s+|\\s+$", "", .))) %>%
+  mutate(across(where(is.character), ~ iconv(., from = "UTF-8", to = "ASCII//TRANSLIT", sub = ""))) # Remove invalid or non-translatable characters
+
+```
+
+There are a total of 17 features in the games dataframe (excluding
+appID):
+
+```{r}
+skim(games_df)
+```
+
+The features `genres`, `developers`, `publishers`, `languages`,
+`fullAudioLanguages`, are all in character datatype, these features
+stores different amount of character elements within a single string in
+comma separated style, since the study would not focus on text
+processing, I will convert these features into a count variable.
+
+Below defines a function to count amount of comma separated elements
+inside a string.
+```{r}
+# Define the function
+count_values <- function(string) {
+  # Check if the input is not empty
+  if (nchar(string) == 0) {
+    return(0)  # Return 0 if the string is empty
+  }
+  
+  # Split the string by commas and count the elements
+  # Trim whitespace and count non-empty elements
+  counts <- strsplit(string, ", ")[[1]]
+  count <- length(counts) # Count non-empty trimmed elements
+  
+  return(count)
+}
+
+# Apply the function for developers, publishers, genres, and categories column
+games_df <- games_df %>%
+  mutate(developerCount = sapply(developers, count_values)) %>%
+  mutate(publisherCount = sapply(publishers, count_values)) %>%
+  mutate(genresCount = sapply(genres, count_values)) %>%
+  mutate(languagesCount = sapply(languages, count_values)) %>%
+  mutate(fullAudioLanguagesCount = sapply(fullAudioLanguages, count_values))
+```
+
+To ensure only historically active and non-free games are included,
+games that are free or with no ratings or recommendations or
+`estimatedOwners` = '0 - 20000', or `averagePlaytime` = 0, will be
+excluded as they are irrelevant data points. Games with `releaseDate` \>
+'2024-07-01' will also be excluded, because these games are released too
+recently and may not contain sufficient data for generalization.
+```{r}
+games_df.filtered <- games_df %>% filter(recommendations > 0 & estimatedOwners != '0 - 0' & estimatedOwners != '0 - 20000' & averagePlaytime > 0 & (positive + negative) !=0 & releaseDate < "2024-07-01" & price != 0)
+
+dim(games_df.filtered)
+```
+
+### `averagePlaytime`&`medianPlaytime`
+
+These features contains info on how much total minutes is spent on a
+game by each player on average for a given game. Median means that half
+of all users played equal or less than this amount of minutes.
+
+```{r}
+summary(games_df.filtered$averagePlaytime)
+summary(games_df.filtered$medianPlaytime)
+```
+### Relative Difference ((Mean - Median) / Mean)
+
+A traditional skewness measure cannot be calculated since the standard
+deviation of the distribution of total playtime for a game is not
+provided, however, I will use the relative difference between the mean
+and median as an estimated measure of skewness:
+
+-   Higher number (mean \> median) indicates a right skew (tail on the
+    right side) in the distribution of total playtime, meaning the total
+    playtime are lower for most players, but there are some rare
+    instance of players with a high total playtime.
+```{r}
+games_df.filtered <- games_df.filtered %>% 
+  mutate(estimatedSkew = (averagePlaytime - medianPlaytime)/ averagePlaytime) %>%
+  mutate(playtimeRatio = averagePlaytime / medianPlaytime)
+
+hist(games_df.filtered$estimatedSkew)
+```
+There are many games with the exact same median and average playtime, it
+is very rare to see a perfectly symmetrical distribution for total
+gametime minutes, however, in cases of very small sample sizes for a
+given game (e.g., just one or two observations), the mean and median
+playtime can easily equal to each other, resulting in zero for this
+measure, but this implies that the data collected for this game is not
+accurate as the player data is insufficient. I will filter out games
+where `estimatedSkew` == 0.
+```{r}
+games_df.filtered <- games_df.filtered %>% filter(estimatedSkew != 0)
+dim(games_df.filtered)
+
+hist(games_df.filtered$estimatedSkew, main = 'Distribution of estimated skew', xlab = 'estimatedSkew', breaks = 30)
+```
+```{r}
+plot(x = games_df.filtered$estimatedSkew, y = log(games_df.filtered$recommendations + 1), pch = 20,
+     cex = 0.5, xlab = "Estimated Skew", ylab = "Log(Recommendations)")
+```
+There indicates some positive relationship between estimated skew and
+the log-transformed recommendations amount.
+
+Transforming minutes into hours and days.
+```{r}
+games_df.filtered <- games_df.filtered %>%
+  mutate(averagePlayHours = averagePlaytime / 60) %>%
+  mutate(medianPlayHours = medianPlaytime / 60) %>%
+  mutate(averagePlayDays = averagePlayHours / 24) %>%
+  mutate(medianPlayDays = medianPlayHours / 24)
+
+summary(games_df.filtered$averagePlayHours)
+summary(games_df.filtered$averagePlayDays)
+```
+### Playtime
+
+```{r}
+hist(games_df.filtered$medianPlaytime, breaks = 50)
+```
+The `medianPlaytime` appears to have a highly skewed distribution, I
+will perform log transformation for this feature.
+```{r}
+games_df.filtered <- games_df.filtered %>% mutate(logMedianPlaytime = log(1 + medianPlaytime))
+
+hist(log(games_df.filtered$logMedianPlaytime),
+     breaks = 40,
+     main = "Log Median Playtime distribution",
+     xlab = "Log Median Playtime")
+```
+### `aboveTwoHours` indicator
+
+One of the most critical aspects of the 2-hour mark is that it is the
+threshold for Steam's refund policy. Players can request a refund for
+games they have played for less than 2 hours, which incentivizes
+developers to create games that players find engaging enough to exceed
+this playtime. This can lead to a higher likelihood of players keeping
+the game if they enjoy it beyond the initial hours. I will be creating a
+indicator for games that have median playtime exceeding 2 hours.
+[Source](https://galyonk.in/median-playtime-on-steam-8a3d67fda84d)
+
+```{r}
+games_df.filtered <- games_df.filtered %>%
+  mutate(aboveTwoHours = ifelse(medianPlaytime > 120, 1, 0))
+
+table(games_df.filtered$aboveTwoHours)
+```
+`genres`, `publishers`, and `developers` variables each contains a comma
+separated list of the respective attributes stored in a string. I
+defined a helper function to count frequency of unique words within a string.
+```{r}
+count_feature <- function(df, string_feature){
+  # defining a function to count frequency of unique words within a string.
+  # e.g. "Casual, Indie, Sports", "..."
+  # outputs a table of unique values within the string list and its frequency.
+  
+  # Split the string by comma, resulting in a single list of lists of strings.
+  split_features <- strsplit(df[,string_feature], ", ")  # Split on comma
+  
+  # Unlist/flatten the lists into a single vector
+  all_features <- unlist(split_features)
+  
+  #  create frequency table to count how many times each unique genre appears
+  feature_counts <- table(all_features)
+  feature_counts_df <- as.data.frame(feature_counts)
+  colnames(feature_counts_df) <- c(string_feature, "Frequency")
+  feature_df <- feature_counts_df %>% 
+                arrange(desc(Frequency))
+  feature_df
+}
+```
+
+### `genres` feature
+
+Contains broad categories that define a game's core mechanics and style
+of play.
+
+```{r}
+head(count_feature(games_df.filtered, 'genres'),20)
+```
+
+Although most of the game genres are related to games, some of them
+refers to either production software or other non-game related software.
+
+I am removing these unrelated genres because this project will focus on
+playable video games and will not include non-gaming related
+applications, the games with non-gaming related genres also only
+accounts to less than 10% of all other genres.
+
+The following code reviews the non-gaming related genres first.
+
+```{r}
+# Filter games with non-game related genres
+exclude_genres = c('Audio Production',
+                  'Game Development',
+                  'Design & Illustration',
+                  'Utilities',
+                  'Software Training',
+                  'Photo Editing',
+                  'Accounting',
+                  'Animation & Modeling',
+                  'Web Publishing',
+                  'Video Production',
+                  'Education',
+                  'Movie',
+                  'Short',
+                  '360 Video',
+                  'Documentary',
+                  'Episodic',
+                  'Tutorial')
+
+# Split the genres into a list for filtering
+genres_split <- strsplit(as.character(games_df.filtered$genres), ", ")
+
+# define function that returns TRUE if any of the element within a vector contains `exclude_genres`
+check_genre <- function(x){
+    any(x %in% exclude_genres)
+  }
+
+# sapply() applies the function to each element of games_df$genres_split, returning a logical vector
+exclude_rows <- sapply(genres_split, check_genre)
+
+games_df.filtered <- games_df.filtered[!exclude_rows,]
+```
+
+Barplot of genre frequency
+
+```{r}
+count_feature(games_df.filtered,'genres') %>% 
+  ggplot(aes(x = reorder(genres, Frequency), y = Frequency)) +
+  geom_bar(stat = "identity") +  # stat based on the values provided in the data frame.
+  coord_flip() +                  
+  labs(title = "Genre Frequency (Filtered)", x = "Genre", y = "Frequency")
+```
+### `age16`
+
+This feature indicates whether a game's required age is 16+.
+```{r}
+games_df.filtered <- games_df.filtered %>%
+  mutate(age16 = ifelse(required_age > 16, TRUE, FALSE))
+
+boxplot(price ~ age16  ,data = games_df.filtered)
+boxplot(log(recommendations + 1) ~ age16, data = games_df.filtered, ylab = "log(recommendations)")
+
+table(games_df.filtered$age16)
+```
+It could be seen that games with age requirement of 16+ are both more
+recommended and higher priced.
+
+\###`developers` & `publishers`
+
+These are the developers who developed the game, and publishers who are
+responsible for distribution, marketing and sales of a game.
+```{r}
+str(games_df.filtered$developers)
+```
+Distribution of `developersCount`,`publishersCount`,`genresCount`
+```{r}
+hist(games_df.filtered$developerCount, main = "Developers Count")
+hist(games_df.filtered$publisherCount, main = "Publishers Count")
+hist(games_df.filtered$genresCount, main = "Genres Count")
+hist(games_df.filtered$languagesCount, main = "Languages Count")
+```
+Most of the games have a single developer and publisher, with a
+combination of 2-3 genres.
+
+### Self Publishers
+
+As self publishing a game, where the developer and the publisher are the
+same entity, is a very likely indicator of a game that is developed
+independently (Indie), identifying this characteristic may be a useful
+feature. I will be creating a indicator variable to indicate whether a
+game is self published, not including games with more than 1 developer
+or publisher.
+
+```{r}
+games_df.filtered <- games_df.filtered %>%
+  mutate(selfPublished = (developerCount == 1 & publisherCount == 1) & # only in the case where they work solo
+           trimws(developers) == trimws(publishers))  # trim whitespace
+
+table(games_df.filtered$selfPublished)
+boxplot(price ~ selfPublished, games_df.filtered)
+```
+
+```{r}
+head(count_feature(games_df.filtered,'publishers'),20) %>% 
+  ggplot(aes(x = reorder(publishers, Frequency), y = Frequency)) +
+  geom_bar(stat = "identity") +  # stat based on the values provided in the data frame.
+  coord_flip() +                  
+  labs(title = "Publisher Frequency (Top 20)", x = "Category", y = "Frequency")
+```
+Frequency of developers and publishers in games with over 50,000 recommendations.
+```{r}
+head(count_feature(games_df.filtered[games_df.filtered$recommendations >= 50000,],"developers"),15)
+```
+
+```{r}
+head(count_feature(games_df.filtered[games_df.filtered$recommendations >= 50000,],"publishers"),15)
+
+```
+### `industryLeader` indicator
+
+Among the lists of developers and publishers of games with over 50,000
+recommendations, some big players in the gaming industry have showed up.
+
+I have created a list of current industry leading game developer and
+publishers based on this list with some research and domain knowledge.
+This list consists of companies that are widely recognized and have more
+resources in both developing and publishing a game to maximize sales. A
+indicator variable will be created for whether the `developers` or
+`publishers` column contains a name from this list.
+
+This helps the model in addressing games that may recieve a lot more
+recommendations simply because they were developed by industry leaders.
+
+```{r}
+# Gaming leaders list
+game_leaders <- c("Valve", "Bethesda Softworks","CD PROJEKT RED", "Xbox Game Studios", "2K", "CAPCOM Co.", "Bohemia Interactive","Facepunch Studios","THQ Nordic","Square Enix","Rockstar Games","Rockstar North","Rockstar Toronto", "Ubisoft", "Electronic Arts","Bethesda Game Studios", "Ubisoft Montreal","Game Science","DICE","Amazon Games","Eidos-Montreal","Snail Games USA","Klei Entertainment","Hello Games", "Gearbox Software","343 Industries","Techland","Bungie","FromSoftware","FromSoftware Inc.","BANDAI NAMCO Entertainment","SEGA","Capcom","KOEI TECMO GAMES CO", "LTD.","Konami Digital Entertainment","Warner Bros. Games", "Warner Bros. Interactive Entertainment","WB Games","Deep Silver","Activision","PlayStation PC LLC","Lucasfilm", "LucasArts", "Disney","Pearl Abyss","Tripwire Interactive")
+
+
+game_leaders_regex <- paste(game_leaders, collapse = "|")
+
+games_df.filtered$industryLeader <- grepl(game_leaders_regex, games_df.filtered$publishers, ignore.case = TRUE) |
+                                grepl(game_leaders_regex, games_df.filtered$developers, ignore.case = TRUE)
+```
+
+```{r}
+table(games_df.filtered$industryLeader)
+```
+
+
+### Numeric features
+
+### `recommendations`
+
+This feature contains the number of recommendations given out by
+players.
+
+```{r}
+summary(games_df.filtered$recommendations)
+hist(games_df.filtered$recommendations)
+```
+log-transforemd `recommendations`:
+
+```{r}
+games_df.filtered <- games_df.filtered %>% 
+  mutate(logRecommendations = log(recommendations + 1))
+
+hist(games_df.filtered$logRecommendations)
+```
+Games with recommendation count exceeding 100,000 (~exp(11.50)) will be
+determined as extreme outliers within this dataset and will be removed due
+to the limited data of such games, their inclusion could significantly
+impact model performance and potentially hinder accurate predictions for
+the majority of games with more typical recommendation counts.
+
+```{r}
+games_df.filtered<- games_df.filtered %>% filter(recommendations < 100000)
+
+hist(games_df.filtered$logRecommendations, main = "Histogram of log Recommendations", xlab = "log Recommendations", breaks = 30)
+hist(games_df.filtered$recommendations, main = "Histogram of Recommendations", xlab = "Recommendations", breaks = 40)
+boxplot(logRecommendations ~ aboveTwoHours, data = games_df.filtered)
+boxplot(logRecommendations ~ industryLeader, games_df.filtered)
+```
+Boxplot shows games with median playtime above two hours or games from
+industry leaders recieve higher amount of recommendations on average.
+
+```{r}
+boxplot(logRecommendations ~ languagesCount, games_df.filtered)
+```
+
+Games with more supported languages also were shown to receive more
+recommendations.
+
+### `price`:
+
+```{r}
+hist(games_df.filtered$price, main = "Price distribution")
+summary(games_df.filtered$price)
+```
+
+```{r}
+boxplot(price ~ industryLeader, data = games_df.filtered)
+boxplot(price ~ aboveTwoHours, data = games_df.filtered)
+```
+Games from industry leaders or with over two hours median playtime are
+on average higher priced.
+
+### `priceRange`
+
+0-10 = 'Low' 11-20 = 'Medium' 21 or above = 'High'
+
+```{r}
+# Define price ranges
+price_breaks <- c(0, 10, 20, Inf) 
+
+# Create labels for the price ranges
+price_labels <- c("Low", "Medium", "High")
+
+# Create the categorical variable
+games_df.filtered$priceRange <- cut(games_df.filtered$price, breaks = price_breaks, labels = price_labels, right = TRUE)
+
+table(games_df.filtered$priceRange)
+```
+
+```{r}
+boxplot(logRecommendations ~ priceRange, data=games_df.filtered)
+```
+
+Boxplot shows the price range of games have some positive relationships
+with log-recommendations.
+
+### `releaseDate`
+
+This feature is the date that the game has been published/released on
+the Steam platform specifically, and does not reflect the earliest
+release date of a game on any other platform.
+
+I will perform some feature engineering on the `releaseDate` variable to
+obtain years since released, days since released, released month, and
+released year:
+
+```{r}
+# extract month from `releaseDate` and convert it to a factor with levels in chronological order
+games_df.filtered <- games_df.filtered %>%
+  mutate(releaseMonth = month(releaseDate)) %>%
+  mutate(releaseYear = year(releaseDate)) %>% 
+  mutate(yearsReleased = 2024 - releaseYear) %>% # Years since released
+  mutate(daysReleased = as.numeric(as.Date("2024-10-01") - releaseDate)) # days since released
+
+ 
+# boxplots
+boxplot(logRecommendations ~ yearsReleased,
+        data = games_df.filtered)
+boxplot(price ~ yearsReleased,
+        data = games_df.filtered)
+```
+It is shown that price of games decreases gradually as released years
+gets higher until the price reaches around 10.
+
+```{r}
+plot(games_df.filtered$daysReleased, games_df.filtered$logRecommendations, pch = 20,
+     cex = 0.8, xlab = "Days Released", ylab = "Log Recommendations")
+```
+The recommendations count also seems to decrease slightly as days released gets higher.
+
+More boxplots on `price`:
+
+```{r}
+par(mfrow = c(1,2))
+boxplot(price ~ yearsReleased,
+        data = games_df.filtered[games_df.filtered$selfPublished == TRUE,],
+        main = "Self-Published")
+boxplot(price ~ yearsReleased,
+        data = games_df.filtered[games_df.filtered$selfPublished == FALSE,],
+        main = "Non-Self-Published")
+```
+
+Self-Published games are shown to have lower price on average, compared
+to other games throughout the years. Some interaction between
+`selfPublished` and `yearsReleased` is observed when looking at their
+effects on `price`.
+
+```{r}
+hist(games_df.filtered$releaseYear, main = "#Games Released by year", breaks = 30)
+```
+
+The surge in games listed on Steam from 2013 to 2016 could be due to
+changes in Valve (Steam) policies that allowed developers to submit
+their games for community voting and approvals. After that, a rapid drop
+from 2016 onwards could be due to some of the game records missed during
+data collection.
+
+I will remove games released on Steam from 1995 - 2008 since these older
+games that could introduce patterns that no longer hold true and would
+not be relevant for the task of modelling based on more recent dynamics
+of the market.
+
+```{r}
+games_df.filtered <- games_df.filtered %>% filter(releaseDate > '2008-12-31')
+dim(games_df.filtered)
+```
+
+### Some other numeric features:
+
+### `positive`/`negative`
+
+Number of positive or negative reviews.
+
+I created a new variable which reflects the proportion of positive
+reviews as `positivePct`.
+
+```{r}
+games_df.filtered <- games_df.filtered %>%
+  mutate(positivePct = coalesce(positive/(positive + negative), 0))
+
+hist(games_df.filtered$positivePct, main = "Positive Pct")
+
+plot(x = games_df.filtered$positivePct, y = games_df.filtered$logRecommendations, pch = 20,
+     cex = 0.5, xlab = "Positive pct.", ylab = "Log Recommendations")
+```
+
+Most games have a high positive rating percentage, with the most amount
+of games with 80-90% positive reviews.
+
+### `achievements`
+
+This feature contains number of achievements/milestones available in a
+game. The distribution of achievement amount is right-skewed with the
+long tail on higher amount of achievements. I will log transform this
+feature as a new feature for easier interpretation.
+
+```{r}
+print(summary(games_df.filtered$achievements))
+hist(games_df.filtered$achievements, breaks = 30)
+
+games_df.filtered <- games_df.filtered %>% mutate(logAchievements = log(1 + achievements))
+hist(games_df.filtered$logAchievements, breaks = 30)
+```
+
+It seems that most games have zero achievements (log(1)), but many also
+have extremely large number of achievements
+
+```{r}
+boxplot(logAchievements ~ aboveTwoHours, data = games_df.filtered)
+boxplot(logAchievements ~ priceRange, data = games_df.filtered)
+```
+
+It is shown that games with median playtime over two hours have at least
+some achievements in the game, and games with higher price have more achievements on average.
+
+### `dlcCount`
+
+This feature contains number of downloadable contents "DLC" available in
+a game.
+
+```{r}
+hist(games_df.filtered$dlcCount, breaks = 100)
+```
+
+I will cap the `dlcCount` to 30, which is a suitable cap for most games,
+games with over 30 DLCs usually have a very specific design which is to
+update and expand gaming contents constantly.
+
+```{r}
+head(games_df.filtered[games_df.filtered$dlcCount > 30,][1:6])
+```
+
+```{r}
+games_df.filtered <- games_df.filtered %>% 
+  mutate(dlcCount = ifelse(dlcCount > 30, 30, dlcCount))
+hist(games_df.filtered$dlcCount, breaks = 100, main = "Histogram of DLC Count")
+```
+
+```{r}
+boxplot(logRecommendations ~ dlcCount, data = games_df.filtered)
+```
+
+It is shown that games with more dlc count leads to higher
+recommendations, there is more fluctuations in recommendations count for
+games with over 13 DLCs as there is not much data for this type of
+games, but their recommendation count remains on the relatively high
+range on average regardless.
+
+### Final look at cleaned data
+```{r}
+skim(games_df.filtered)
+```
+
+### Correlation Analysis in games data
+
+```{r}
+numeric_df <- games_df.filtered[,c('logRecommendations','recommendations','price','estimatedSkew','positivePct','dlcCount','medianPlaytime','logMedianPlaytime','daysReleased','languagesCount','aboveTwoHours','selfPublished','age16','industryLeader')]
+
+# Calculate correlation matrix
+corr_matrix <- cor(numeric_df)
+
+corrplot(corr_matrix, method = "color", type = "upper", 
+         addCoef.col = "black", # Add correlation coefficients in black color
+         tl.col = "black",tl.srt = 45,tl.cex = 0.8, # Text label color and rotation
+         number.cex = 0.6) # Adjust size of the numbers
+```
+
+Additionally, I will perform PCA on some of the strong features and use first two principal components / dimensions to visualize their correlation.
+```{r}
+numeric_pca <- games_df.filtered[,c('logRecommendations','price','estimatedSkew','positivePct','dlcCount','logMedianPlaytime','daysReleased','languagesCount','industryLeader')]
+
+
+pca_result <- prcomp(numeric_pca, scale = T)
+
+biplot(pca_result, 
+       scale = 0, 
+       cex = c(0.2,0.6), 
+       col = c('grey','black'))
+#,xlim = c(-7,4))
+```
+
+Look at PVE of the result
+```{r}
+explained_variance <- summary(pca_result)$importance[2, ] # Proportion of variance explained
+cumulative_variance <- cumsum(explained_variance) # Cumulative variance explained
+num_components <- which(cumulative_variance >= 0.8)[1] # Retain components to explain 90% of variance
+plot(cumulative_variance,
+     xlab = 'Principal Components', 
+     ylab = "Cumulative PVE",
+     main = "PCA Screeplot")
+
+# vertical line at num_components
+abline(v = num_components, col = "red", lwd = 2, lty = 2) 
+
+# text next to the vertical line
+text(num_components + 0.5, 0.85, 
+     labels = paste("80% PVE at PC", num_components), 
+     col = "red", pos = 4)
+```
+PC1 and PC2 together explains around 48% of the data.
+### Correlation between features and Initial Features selection
+
+For the regression task: Based on using ‘recommendations’ as the target variable, the correlation plot and PCA biplot in Figure 1.5 shows that ‘estimatedSkew’, ‘price’, ‘positivePct’, ‘languagesCount’, ‘age16’, ‘dlcCount’  and ‘industryLeader’ has the strongest correlation with the log target variable, also, log transformed ‘medianPlaytime’ have a higher correlation value with the log target variable compared to its original values. These features were selected for the regression task. 
+
+For the classification task: Based on using ‘priceRange’ as the target variable, ‘dlcCount’, ‘daysReleased’, ‘languagesCount’, ‘age16’, ‘industryLeader’, ‘selfPublished’ and ‘aboveTwoHours’ have relatively strong correlation with the ‘price’ variable, also the log transformed ‘medianPlaytime’ and ‘recommendations’ have a much higher correlation than its original value. These features were selected for the classification task.
+
+### `tags_df` data cleaning
+
+The `tags` feature contains a list of user-generated tags voted to a
+game, and a inner-list containing the frequency of that tag, the
+extracted dataframe `tags_df` is in a long format, where each row
+represents a tag and frequency for a game. The games in this dataframe
+are filtered so that it only includes games from `games_df.filtered`
+dataframe.
+```{r}
+# Filter out to only include games from games_df.filtered 
+tags_df.filtered <- tags_df %>%
+  filter(appID %in% games_df.filtered$appID)
+
+tags_df.filtered <- tags_df.filtered %>%
+  mutate(tag = make.names(tag))    # make sure names comply with R's variable naming scheme
+
+head(tags_df.filtered,10)
+```
+
+I will extract only the top 20 tags of each game, based on the frequency
+of the voted tag for the game.
+```{r}
+# top 20 tags for each appID
+top_tags <- tags_df.filtered %>%
+  group_by(appID) %>%
+  mutate(frequency = as.numeric(frequency)) %>%
+  arrange(desc(frequency)) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 20) %>%
+  #mutate(tagPct = as.numeric(frequency / sum(frequency))) %>%# add proportion column
+  ungroup()
+
+head(top_tags)
+
+length(unique(top_tags$tag))
+```
+
+Top and bottom 20 used tags
+```{r}
+tags_freq <- top_tags %>% 
+  group_by(tag) %>%
+  summarise(frequency = sum(frequency)) %>%
+  arrange(desc(frequency))
+
+ggplot(head(tags_freq, 20), 
+       aes(x = reorder(tag, frequency), y = frequency)) + # reorder tags by frequency
+geom_bar(stat = "identity") +  
+coord_flip() +                  
+labs(title = "Top 20 tags voted by players", x = "tags", y = "Frequency")
+```
+
+```{r}
+ggplot(tail(tags_freq, 20), aes(x = reorder(tag, frequency), y = frequency)) + # reorder tags by frequency
+geom_bar(stat = "identity") +  
+coord_flip() +                  
+labs(title = "Bottom 20 tags voted by players", x = "tags", y = "Frequency")
+```
+
+These tags were voted less than 300 times (all games combined).
+
+## Unsupervised Learning
+
+For the Unsupervised learning part of this coursework, I will be using
+the user-generated tags frequency for each game to find clusters of tags
+that are similar.
+
+### Euclidean distance based Hierarchical Clustering
+
+Hierarchical clustering can be used to find common groups within
+different tags. The euclidean distance between tags based on their usage
+and frequency across different games can be used to find tags that are
+"close" to each other.
+```{r}
+# Transpose and Pivot to wide format
+tags_games <- pivot_wider(top_tags, 
+                              id_cols = tag,  # row
+                              names_from = appID, # col
+                              values_from = frequency) # value
+
+tags_games[is.na(tags_games)] <- 0  # fill na to zero
+colnames(tags_games) <- make.names(colnames(tags_games)) # make sure names comply with R's variable naming scheme
+head(tags_games[1:6])
+```
+
+Format as matrix form and get distance matrix
+```{r}
+tags_games.labs <- tags_games$tag
+tags_games.data <- tags_games[,-1]# exclude first col
+# scale the frequency
+tags_games.scaled <- scale(tags_games.data) 
+# calculate distances
+tags_games.dist <- dist(tags_games.scaled)
+```
+
+Hierarchical clustering using distance matrix
+```{r}
+plot(hclust(tags_games.dist),
+     labels = tags_games.labs,
+     main = "Euclidean-distance Clustering",
+     xlab = "",
+     ylab = "",
+     cex = 0.2)
+plot(hclust(tags_games.dist, method = "average"),
+     labels = tags_games.labs,
+     main = "Average Linkage",
+     xlab = "",
+     ylab = "",
+     cex = 0.3)
+```
+Look at cluster assignments when K = 7.
+```{r}
+tags_games.dist_hclust <- hclust(dist(tags_games.scaled))
+dist_hclust.clusters <- cutree(tags_games.dist_hclust, 10)
+
+data.frame(table(dist_hclust.clusters))
+```
+Look at some tags in cluster 1 and 9
+```{r}
+dist_clusters <- data.frame(tag = tags_games.labs, cluster = dist_hclust.clusters)
+
+head(dist_clusters[dist_clusters['cluster'] == 1],10)
+head(dist_clusters[dist_clusters['cluster'] == 9],10)
+```
+
+When the tags are seperated into 10 clusters, it could be seen that most
+of the tags are grouped in cluster 1, while cluster 9 for example,
+contains popular tags like "Multiplayer", "Online Co-op" and "Co-op",
+this could be due to the fact that the euclidean distance takes into
+account the raw frequency of the tags voted for each game, since each
+game only consists of 10-20 tags, the distribution of tag frequency for
+each game would be zero-inflated, this zero-inflation can lead to many
+tags having low or no frequencies across games, which is most likely why
+they have been grouped together, and since user-generated Tag
+frequencies are heavily influenced by game popularity, a popular game
+will naturally have higher frequencies of tags, this introduces tag
+outliers, where tags that ties with very popular games would be grouped
+by itself because they have longer euclidean distance to any other tags.
+
+I will then try a correlation-based distance to measure dissimilarity
+between tags, which focuses on relationships between tags rather than
+their raw frequency/magnitude.
+
+### Correlation-based distance Hierarchical Clustering
+
+```{r}
+# corr matrix
+tags_games.corr <- cor(t(tags_games.scaled))
+# 1 - correlation to convert to correlation-based dissimilarity matrix
+tags_games.corr_dist <- as.dist(1 - tags_games.corr)
+
+plot(hclust(tags_games.corr_dist),
+     labels = tags_games.labs,
+     main = "Complete Linkage",
+     xlab = "",
+     ylab = "",
+     cex = 0.3)
+
+plot(hclust(tags_games.corr_dist, method = "average"),
+     labels = tags_games.labs,
+     main = "Average Linkage",
+     xlab = "",
+     ylab = "",
+     cex = 0.3)
+```
+
+```{r}
+plot(hclust(tags_games.corr_dist),
+     labels = tags_games.labs,
+     main = "Correlation-based distance Clustering",
+     xlab = "",
+     ylab = "",
+     cex = 0.2)
+rect.hclust(hclust(tags_games.corr_dist), k = 7)
+```
+Look at cluster assignments frequency when K = 7.
+```{r}
+corr_hc <- hclust(tags_games.corr_dist)
+
+corr_hc.clusters <- cutree(corr_hc, k = 7)
+tag_cluster <- data.frame(tag = tags_games.labs, cluster = corr_hc.clusters)%>%
+  arrange(cluster)
+
+data.frame(table(corr_hc.clusters))
+```
+Look at tag assignments from correlation matrix of raw tag frequencies
+```{r}
+# print out first 10 tags in each cluster
+for (i in 1:length(unique(tag_cluster$cluster))) {
+  cat('\ncluster',i,': [',head(tag_cluster[tag_cluster['cluster']==i],20),
+      ',...]')
+}
+```
+Based on the dendrogram of clustering using complete linkage method, it
+could be seen that there are 7 major clusters based on a
+correlation-based distance between tags. It is also shown that each of
+the clusters have tags that are more similar to each other
+compared to euclidean-based distance. For example, strategic
+shooting games-related tags are all in the same cluster, and
+singleplayer or roleplaying games-related tags are in another cluster, and so on.
+
+The results shows that using correlation-based distances can help
+mitigate some issues associated with zero-inflation, as it focuses on
+the relative patterns of usage rather than absolute counts.
+
+There is one cluster that contains a lot more tags than any other
+clusters, this cluster is formed mostly by merging a lot of other
+smaller clusters during the clustering process, and have formed a single
+"branch" of its own, with many inner clusters merged sequentially, this
+could indicate that the tags within this cluster are heterogeneous, and
+that it contains a diverse mix of tags with weak or no meaningful
+relationships between them. Within this cluster, some commonly used tags
+like "MMORPG" and "Casual" are present, while the remaining tags within
+the cluster seems to be too specific or unrelated to each other for the
+algorithm to group them meaningfully, which could be the reason why they
+are all grouped together in this one cluster.
+
+### PCA
+
+Based on previous results in hierarchical clustering, it has been shown
+that correlation-based dissimilarity distances are useful for grouping
+tags into clusters. To further improve the quality of clusters, I will
+try reducing dimensionality of the tags data before performing
+clustering to minimize noise and redundant information. In this context,
+Principal Component Analysis (PCA) can be utilized to identify linear
+combinations of different tags that maximize the variance in the data.
+
+PCA examines the relationships between tags based on their frequency
+across all games. Tags that frequently appear together tend to have
+strong loadings on the same principal components, indicating that they
+contribute similarly to the overall variance. Moreover, hierarchical
+clustering can then be applied to the principal component scores, using
+the distances between these projected loading scores to derive more
+refined clusters.
+```{r}
+tags.wide <- pivot_wider(top_tags, 
+                              id_cols = appID,  # row
+                              names_from = tag, # col
+                              values_from = frequency) # value
+tags.wide[is.na(tags.wide)] <- 0  # fill na to zero
+colnames(tags.wide) <- make.names(colnames(tags.wide)) # this make sure names comply with R's variable naming scheme
+head(tags.wide[1:6])
+dim(tags.wide)
+```
+
+Perform PCA
+```{r}
+# scale first
+tags_scaled <- scale(tags.wide[,-1])
+
+pca_result <- prcomp(t(tags_scaled))
+```
+
+Choose number of components
+```{r}
+explained_variance <- summary(pca_result)$importance[2, ] # Proportion of variance explained
+cumulative_variance <- cumsum(explained_variance) # Cumulative variance explained
+num_components <- which(cumulative_variance >= 0.9)[1] # Retain components to explain 90% of variance
+plot(cumulative_variance,
+     xlab = 'Principal Components', 
+     ylab = "Cumulative PVE",
+     main = "PCA Screeplot")
+
+# vertical line at num_components
+abline(v = num_components, col = "red", lwd = 2, lty = 2) 
+
+# text next to the vertical line
+text(num_components + 0.5, 0.85, 
+     labels = paste("90% PVE at PC", num_components), 
+     col = "red", pos = 4)
+```
+
+Project tags data onto PCA space
+```{r}
+# project the tag frequencies onto the PC space
+pca_scores <- as.data.frame(pca_result$x)
+
+# Subset the PC up to 90% PVE
+pca_scores_subset <- pca_scores[, 1:num_components]
+
+head(pca_scores_subset[1:6])
+```
+
+Calculate Correlation-based distance matrix of tags based on PCs
+```{r}
+
+# calculate the correlation matrix
+pca_cor_matrix <- cor(t(pca_scores_subset))
+
+# Convert the correlation matrix to a dissimilarity distance matrix
+pca_cor_distance <- as.dist(1 - pca_cor_matrix)
+
+# perform hierarchical clustering
+pca_hclust <- hclust(pca_cor_distance, method = "complete")
+```
+Examining cluster assignments
+
+Plotting dendrogram with colored branches and group number, used modified code from:  https://stackoverflow.com/questions/48636522/label-r-dendrogram-branches-with-correct-group-number
+```{r}
+pca_clusters <- cutree(pca_hclust, k = 7)
+
+# Create dendrogram
+dend <- as.dendrogram(pca_hclust)
+
+colors = RColorBrewer::brewer.pal(7, "Dark2")
+
+# below code is from: https://stackoverflow.com/questions/57674446/how-to-associate-cluster-labels-and-dendrogram-in-the-same-order-on-a-plot?noredirect=1&lq=1 
+dend.cutree <- dendextend:::cutree(pca_hclust, k=7, order_clusters_as_data = FALSE)
+
+idx <- order(names(dend.cutree))
+dend.cutree <- dend.cutree[idx]
+df.merge <- merge(pca_clusters,dend.cutree,by='row.names')
+df.merge.sorted <- df.merge[order(df.merge$y),]
+lbls<-unique(df.merge.sorted$x)
+dend1 <- color_branches(pca_hclust, k = 7, groupLabels = lbls, col = colors[lbls])
+plot(dend1, leaflab = 'none', main = "Tag Clustering w/ PC score correlation-distance")
+
+```
+Around 7 major clusters could be determined after cutting the dendrogram.
+```{r}
+pca_clusters <- cutree(pca_hclust, k = 7)
+
+print(data.frame(table(pca_clusters)))
+```
+PC variance and PCs plot with cluster assignments
+```{r}
+# calculate variance explained
+pca.var <- pca_result$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var), 3)
+
+pca.data <- data.frame(tag = rownames(pca_result$x),
+                       X = pca_result$x[,1],
+                       Y = pca_result$x[,2],
+                       Z = pca_result$x[,3])
+
+pca.data$cluster <- factor(pca_clusters)
+
+ggplot(data = pca.data,
+       aes(x = X, y = Y, label = tag, color = cluster)) +
+  geom_text(size = 3) +
+  xlab(paste("PC1, PVE: ", pca.var.per[1], sep = "")) +
+  ylab(paste("PC2, PVE: ", pca.var.per[2], sep = "")) +
+  ggtitle("PCA plot of first two principal components") +
+  scale_color_brewer(palette = "Dark2")
+
+```
+3D plot for first 3 PCs
+```{r}
+# Open a new 3D plotting window and create an empty plot (type = "n")
+plot3d(pca.data$X, pca.data$Y, pca.data$Z,
+       type = "n",  # Do not plot points immediately
+       xlab = paste("PC1, PVE: ", pca.var.per[1], sep = ""),
+       ylab = paste("PC2, PVE: ", pca.var.per[2], sep = ""),
+       zlab = paste("PC3, PVE: ", round(pca.var.per[3], 3), sep = ""))
+
+# Add text labels at each point's coordinates.
+# Here, 'texts' are taken from the 'tag' column and colored according to the cluster.
+text3d(pca.data$X, pca.data$Y, pca.data$Z,
+       texts = pca.data$tag,
+       col = pca.data$cluster,
+       cex = 0.7)  # Adjust 'cex' to control text size
+```
+
+Tag clustering from correlation matrix of pc scores of each tag (first 10 tags of each cluster).
+```{r}
+tag_pc_cluster <- data.frame(tag = names(pca_clusters), 
+                             cluster = pca_clusters)
+
+# print out first 10 tags in each cluster
+for (i in 1:length(unique(tag_pc_cluster$cluster))) {
+  cat('\ncluster',i,': [',head(tag_pc_cluster[tag_pc_cluster['cluster']==i],10),
+      ',...]')
+}
+```
+Overall, the resulting cluster assignments slightly matched those from clustering the raw tag frequencies directly, but due to concerns with zero-inflation, which might distort principal components, and the fact that there is not much reduction in data dimensionality (from 433 to 252 features), I have chose to use the clustering results from the original correlation matrix of raw tag frequencies. 
+
+### Further Analysis in `logRecommendations` and `price` using defined clusters of tags.
+
+I will first assign the tag names to respective cluster number based on
+previous hierarchical clustering results, and then transform the cluster
+frequencies into weights based on the proportion of the individual
+clusters.
+```{r}
+# Assign tag names of different games to cluster number and regroup
+appClusterFrequency <-  top_tags %>%
+  left_join(tag_cluster, by = "tag") %>%
+  dplyr::select(appID,cluster, frequency) %>%
+  group_by(appID, cluster) %>%
+  summarise(frequency = sum(frequency))
+
+head(appClusterFrequency)
+```
+
+Calculate weights
+```{r}
+appClusterWeights <- appClusterFrequency %>%
+  group_by(appID) %>%
+  mutate(weight = frequency / sum(frequency)) %>%
+  ungroup()
+
+head(appClusterWeights, 10)
+```
+
+```{r}
+# Pivot Frequency to wide format
+clusterWeight.wide <- pivot_wider(appClusterWeights, 
+                              id_cols = appID,  # row
+                              names_from = cluster, # col
+                              values_from = weight) # value
+
+clusterWeight.wide[is.na(clusterWeight.wide)] <- 0  # fill na to zero
+colnames(clusterWeight.wide) <- make.names(colnames(clusterWeight.wide)) # this make sure names comply with R's variable naming scheme
+head(clusterWeight.wide)
+```
+
+A cluster count variable will also be derived and examined in the
+following code.
+```{r}
+cluster.count <- clusterWeight.wide %>%
+  mutate(clusterCount = rowSums(dplyr::select(., -appID) != 0)) %>%
+  dplyr::select(appID, clusterCount)
+head(cluster.count)
+hist(cluster.count$clusterCount)
+```
+
+```{r}
+# join game data to add `logRecommendations` feature
+clusterRecommendations <- left_join(games_df.filtered[,c("appID","logRecommendations","price")], cluster.count, by = "appID")
+clusterRecommendations <- left_join(clusterRecommendations,  clusterWeight.wide, by = "appID")
+
+clust_corr_matrix <- cor(clusterRecommendations[,-1])
+
+corrplot(clust_corr_matrix, method = "color", type = "upper", 
+         addCoef.col = "black", # Add correlation coefficients in black color
+         tl.col = "black",tl.srt = 45,tl.cex = 1, # Text label color and rotation
+         number.cex = 0.8) # Adjust size of the numbers
+```
+
+It could be seen that cluster 1 and cluster 5 have some linear
+associations with log recommendations and price. The cluster counts was
+also shown to have some linear associations with recommendations, since
+each cluster represents a group of tags that are related to each other,
+having presence in more clusters means the game have tags that are
+diverse and not redundant. For this reason, I will include the cluster
+weights and cluster counts for my regression problem as predictors.
+Similarly, Cluster weights will be included for my classification task
+too.
+
+### Regression Model
+
+For the regression task, I will use the Negative Binomial Regression
+model to predict `recommendations`, since this is a count variable with
+variance a lot higher than the mean, a Negative Binomial Regression
+model is suitable because it is specifically designed to handle
+overdispersion of a count variable.
+
+The initial selected predictors for the models will be:`estimatedSkew`,
+`price`, `positivePct`, `languagesCount`, `age16`, `industryLeader`,
+`logMedianPlaytime`, `dlcCount`, `clusterCount`, and the cluster
+weights. Since there are a total of 17 features, a subset selection
+process with be implemented to determine a smaller subset of features or
+coefficients that best optimizes the predictive performance of the model
+and to simplify the model.
+
+### Regression task
+
+The data is split into (8:2) training and testing partitions: - The
+training partition would be used to estimate a generalized test error
+for different models. - The testing partition would be used to evaluate
+the final test error of the selected model.
+
+Three models would be considered for regression task, namely, the
+`Negative Binomial Regression`, `random forest`, and `xgboost`. The
+Negative binomial regression model assumes linear relationships between
+the log-transformed target variable and the independent features, which
+is why I have chosen features that are most correlated with the
+log-transformed target variable, `medianPlaytime` are also log-transformed because it were shown to
+produce stronger correlation to the log-transformed target.
+```{r}
+# features used for both GLM and tree-based models
+regr.features <- left_join(games_df.filtered[,c('recommendations','appID','estimatedSkew', 'price', 'positivePct', 'languagesCount', 'age16', 'industryLeader', 'logMedianPlaytime', 'dlcCount')],
+                               clusterWeight.wide, 
+                               by = 'appID') 
+
+regr.features <- left_join(regr.features, cluster.count, by = 'appID') %>% dplyr::select(-appID) 
+
+# define task to store all features
+regr_task = as_task_regr(regr.features,
+                  target = "recommendations",
+                  id = "regr task all")
+
+# specify that the feature "age16" and "industryLeader" is stratified during split
+regr_task$set_col_roles("age16", c("feature","stratum"))
+regr_task$set_col_roles("industryLeader", c("feature","stratum"))
+
+# Set seed for reproducibility
+set.seed(1)
+# split train test partition
+regr_splits <- partition(regr_task, ratio = 0.8)
+
+print(regr_task)
+```
+
+### Baseline Regression model
+This model would be used as a baseline for comparison of other models.
+```{r}
+# load featureless learner
+regr_featureless = lrn("regr.featureless")
+
+regr_featureless$train(regr_task, regr_splits$train)
+
+prediction_bas = regr_featureless$predict(regr_task, regr_splits$test)
+
+prediction_bas$score(msrs(c("regr.mse","regr.rmse","regr.rsq","regr.mae")))
+```
+### XGBoost
+
+tuning and training XGBoost model with training data.
+```{r, include=FALSE}
+# Define XGBoost learner with tuning parameters
+xgboost_lrn <- lrn("regr.xgboost",
+                   nrounds = to_tune(c(100, 500)), 
+                   max_depth = to_tune(c(1, 3, 5, 7)), 
+                   subsample = to_tune(1e-3, 1, logscale = TRUE), # subsample ratio
+                   colsample_bytree = to_tune(c(0.1, 0.3, 1))) #ratio of columns
+
+# get training partition data
+regr_task.train <- regr_task$clone()
+regr_task.train$filter(rows = regr_splits$train)
+
+# Create a tuning instance
+xgboost_tune_instance <- ti(
+  task = regr_task.train, 
+  learner = xgboost_lrn, 
+  resampling = rsmp("cv", folds = 3), 
+  measures = msr("regr.rmse"), 
+  terminator = trm("none") 
+)
+
+# Create a grid search tuner
+tuner <- tnr("grid_search")
+
+# Run the tuning process
+tuner$optimize(xgboost_tune_instance)
+
+# tuning parameter result
+print(xgboost_tune_instance$result_learner_param_vals)
+```
+
+### Training optimized XGBoost model on whole training partition
+```{r}
+xgboost_lrn_tuned <- lrn("regr.xgboost")
+xgboost_lrn_tuned$param_set$values = xgboost_tune_instance$result_learner_param_vals
+
+xgboost_lrn_tuned$train(regr_task.train)
+```
+
+### Feature importance
+
+Feature importance based on contribution of each feature to the model's
+objective function.
+```{r}
+
+# Extract importance and convert to data.frame
+xgb_regr_importance <- data.frame(
+  feature = names(xgboost_lrn_tuned$importance()),
+  importance = unname(xgboost_lrn_tuned$importance())
+)
+
+# Sort features by importance (descending)
+xgb_regr_importance <- xgb_regr_importance %>%
+  arrange(desc(importance))
+print(xgb_regr_importance)
+```
+```{r}
+ggplot(xgb_regr_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +  # Bar color
+  coord_flip() +  # Horizontal bars for readability
+  labs(
+    title = "Feature Importance in XGBoost Model",
+    x = "Feature",
+    y = "Importance Score"
+  ) +
+  theme_minimal()
+```
+
+### Compare with Decision Tree using top 5 features
+```{r}
+regr_rpart_lrn <- lrn("regr.rpart")
+
+regr_rpart_subset <- regr_task$clone()
+
+#look at how top 5 features from rforest would be plotted
+regr_rpart_subset$select(names(head(xgboost_lrn_tuned$importance(),5)))
+
+regr_rpart_lrn$train(regr_rpart_subset, row_ids = regr_splits$train)
+regr_rpart_pred <- regr_rpart_lrn$predict(regr_rpart_subset,row_ids = regr_splits$test)
+
+rpart.plot(regr_rpart_lrn$model)
+```
+### Test results
+```{r}
+xgboost_prediction <- xgboost_lrn_tuned$predict(regr_task, row_ids = regr_splits$test)
+
+xgboost_prediction$score(msrs(c("regr.mse","regr.rmse","regr.rsq","regr.mae")))
+
+xgboost_residuals <- xgboost_prediction$truth - xgboost_prediction$response
+
+
+plot(xgboost_prediction$response, xgboost_prediction$truth, 
+     main = "Actual vs. Predicted", 
+     xlab = "Predicted Values", 
+     ylab = "Actual Values",
+     pch =20,
+     cex = 0.8)
+abline(0, 1)  # Line of perfect prediction
+
+hist(xgboost_residuals, main = "Histogram of Test Residuals",xlab = "Residuals", breaks = 50)
+
+plot(x = xgboost_prediction$response, y = xgboost_residuals, 
+     main = "Residuals vs. Predicted Values", 
+     xlab = "Predicted Values", 
+     ylab = "Residuals",
+     pch = 20,
+     cex = 0.8)
+abline(h = 0)
+```
+Visualize prediction using important features
+```{r}
+# Get the test data from the task
+test_data <- regr_task$data(rows = regr_splits$test)
+
+# get predictions as df
+predictions_df <- data.frame(
+  truth = xgboost_prediction$truth,
+  response = xgboost_prediction$response
+)
+
+# Combine test data with predictions
+combined_data <- dplyr::bind_cols(test_data, predictions_df)
+
+
+ggplot(combined_data, aes(x = estimatedSkew, y = response)) +
+  geom_point()
+ggplot(combined_data, aes(x = logMedianPlaytime, y = response)) +
+  geom_point()
+
+
+```
+
+### Negative Binomial Regression
+
+Since the target `recommendations` is a count variable that has variance
+a lot higher than the mean, a Negative Binomial would be suitable for
+this problem. I will begin by first determining a subset of features
+using a forward-stepwise selection algorithm, with AIC as criterion of
+subset selection. The selected features would then be used in the
+cross-validation process to estimate the performance measures of the
+model with subset features.
+
+### Forward Stepwise selection for NB, with AIC as criterion
+```{r}
+# get training split for subset selection
+
+nb_regr.full <- glm.nb(as.formula(recommendations ~ .), data = regr_task.train$data())
+nb_regr.null <- glm.nb(as.formula(recommendations ~ 1), data = regr_task.train$data())
+
+fw_nb_regr <- step(nb_regr.null, 
+                   scope = list(lower = nb_regr.null, upper = nb_regr.full), 
+                   direction = "forward", 
+                   k = 2,# AIC criterion
+                   trace = FALSE) # suppress output
+              
+```
+
+```{r}
+# summary of the selected model
+nb_summary <- summary(fw_nb_regr)
+print(nb_summary)
+```
+
+```{r}
+# Calculate and print AIC of the final model
+final_aic <- AIC(fw_nb_regr)
+print(paste("Final AIC:", final_aic))
+```
+
+The log link function is used for the Negative binomial distribution,
+where y = exp(intercept + B1*X + ... + Bn*Xn), the dispersion parameter
+is estimated to be 1.23, which indicates that the assumption of
+overdispersion is fulfilled and preferred over a Poisson GLM.
+
+Almost all predictor variables are statistically significant (p-values
+\< 0.05). This suggests that they have a meaningful relationship with
+the response variable.
+
+Plotting the coefficients
+```{r}
+plot_summs(fw_nb_regr)
+```
+Look at how different predictors is used to estimate `recommendations` (partially) in the model (limited to below 25000)
+```{r}
+
+effect_plot(fw_nb_regr, pred = estimatedSkew, interval = TRUE, plot.points = TRUE, line.colors = 'red',jitter = 0.05) + ylim(0, 10000)
+
+effect_plot(fw_nb_regr, pred = logMedianPlaytime, interval = TRUE, plot.points = TRUE, 
+            jitter = 0.05) + ylim(0, 10000)
+
+effect_plot(fw_nb_regr, pred = positivePct, interval = TRUE, plot.points = TRUE, 
+            jitter = 0.05) + ylim(0, 10000)
+
+effect_plot(fw_nb_regr, pred = X5, interval = TRUE, plot.points = TRUE, 
+            jitter = 0.05) + ylim(0, 10000)
+
+effect_plot(fw_nb_regr, pred = X4, interval = TRUE, plot.points = TRUE, 
+            jitter = 0.05) + ylim(0, 10000)
+```
+### Selected features
+```{r}
+nb_selected_features <- names(coef(fw_nb_regr))[-1] # Exclude the intercept
+print(nb_selected_features)
+```
+
+### Training final model on whole training partition
+```{r}
+# Replace "age16TRUE" with "age16"
+nb_selected_features <- gsub("age16TRUE", "age16", nb_selected_features)
+
+# Prepare formula for the selected features
+nb_selected_formula <- as.formula(paste("recommendations ~", paste(nb_selected_features, collapse = " + ")))
+
+nb_regr.final <- glm.nb(nb_selected_formula, data = regr_task.train$data())
+```
+
+### Test on unseen data
+
+Testing predicted results against observed values on new data.
+```{r}
+# Subset the test data task object to include only the selected features
+regr_task.test_nb <- regr_task$clone()
+regr_task.test_nb$filter(rows = regr_splits$test)
+regr_task.test_nb$select(nb_selected_features)
+
+nb_predicted.test <- predict(nb_regr.final, newdata = regr_task.test_nb$data(), type = "response")
+nb_actual.test <- regr_task.test_nb$data()$recommendations
+
+test_rmse <- sqrt(mean((nb_actual.test - nb_predicted.test)^2))
+test_mae <- mean(abs(nb_actual.test - nb_predicted.test))
+
+cat("Test RMSE:", test_rmse, "\n",
+    "Test MAE:", test_mae)
+
+plot(nb_predicted.test, nb_actual.test, 
+     main = "Actual vs. Predicted", 
+     xlab = "Predicted Values", 
+     ylab = "Actual Values",
+     pch =20,
+     cex = 0.8)
+abline(0, 1)  # Line of perfect prediction
+```
+
+```{r}
+test_residuals <- (nb_actual.test - nb_predicted.test)
+
+nb_pearson_residuals <- (nb_actual.test - nb_predicted.test) / sqrt(nb_predicted.test + nb_predicted.test^2 / nb_regr.final$theta)
+
+
+hist(test_residuals, main = "Histogram of Test Residuals", xlab = "Residual", breaks = 100)
+
+plot(x = nb_predicted.test, y = test_residuals, 
+     main = "Residuals vs. Predicted Values", 
+     xlab = "Predicted Values", 
+     ylab = "Residuals",
+     pch = 20,
+     cex = 0.8)
+abline(h = 0)
+
+hist(nb_pearson_residuals, breaks = 100, main = "Histogram of Pearson Residuals",xlab = "Pearson Residuals")
+
+plot(x = nb_predicted.test, y = nb_pearson_residuals, 
+     main = "Pearson Residuals vs. Predicted Values", 
+     xlab = "Predicted Values", 
+     ylab = "Pearson Residuals",
+     pch = 20,
+     cex = 0.8)
+abline(h = 0)
+```
+### Classification Task
+
+For the classification task, the target would be the ordinal categorical
+`priceRange` variable, containing the category of price range based on
+what price it is currently sold in the Steam platform, where the range
+of prices are defined as: Low = 0-10, Medium = 11-20, and High = 21 or
+above.
+```{r}
+table(games_df.filtered$priceRange)
+```
+
+Since there are some class imbalance in the target variable, the
+training and testing partition would be split using a stratified
+sampling method, which ensures the training and testing partition will
+have a similar distribution as in the original data.
+```{r}
+# all features used in classification tasks
+classif.features <- left_join(games_df.filtered[,c('appID','priceRange','dlcCount', 'daysReleased', 'languagesCount', 'age16', 'industryLeader', 'selfPublished', 'aboveTwoHours', 'logMedianPlaytime', 'logRecommendations')], clusterWeight.wide, by = 'appID') 
+
+classif.features <- left_join(classif.features, cluster.count, by = 'appID') %>% dplyr::select(-appID) 
+
+# define task to store all features
+classif_task = as_task_classif(classif.features,
+                  target = "priceRange",
+                  id = "classif task all")
+# specify that the target and feature "age16" is stratified during split
+classif_task$set_col_roles("priceRange", c("target", "stratum"))
+classif_task$set_col_roles("age16", c("feature","stratum"))
+
+# split train test partition
+classif_splits <- partition(classif_task, ratio = 0.8)
+
+print(classif_task)
+
+```
+
+### Baseline Classification model
+```{r}
+# load featureless learner
+lrn_featureless = lrn("classif.featureless")
+
+lrn_featureless$train(classif_task, classif_splits$train)
+
+prediction_bas = lrn_featureless$predict(classif_task, classif_splits$test)
+
+prediction_bas$confusion 
+prediction_bas$score(msr("classif.ce"))
+```
+### Class Weights to balance cost of Misclassification
+
+Since the classes are imbalanced, I will define weights for different classes by assigning weights that are inversely proportional to the class frequencies. These weights will be used to weight the costs of misclassification of different classes to prevent bias in any of the classes. 
+```{r}
+class_counts = table(games_df.filtered$priceRange)
+
+low_weight <- as.numeric(sum(class_counts) / (class_counts['Low'] * 3))
+medium_weight <- as.numeric(sum(class_counts) / (class_counts['Medium'] * 3))
+high_weight <-  as.numeric(sum(class_counts) / (class_counts['High'] * 3))
+
+cat('Weights: \n', 'Low: ', low_weight, '\nMedium: ', medium_weight, '\nHigh: ', high_weight)
+```
+### Support Vector Machine
+
+The Support Vector Machine (SVM) classifier identifies the optimal hyperplane (or decision boundary) that separates data points from different classes in high-dimensional space. This hyperplane is selected to maximize its distance from the nearest data points (support vectors), creating the widest possible margin. For predicting price ranges using game features and tag clusters, classes may not be linearly separable. The kernel trick addresses this by enlarging the feature space in a specific way, implicitly projecting data into a higher-dimensional space where separation is possible. The Support Vector Machine algorithm can then find the decision boundaries that maximize the margin between classes. Since I have three classes (Low, Medium, High), the algorithm would use a One vs One strategy by default, which would create 3(3-1)/2 = 3 binary classifiers: Low vs Medium, Low vs High, Medium vs High, and the final classification would be the class to which it was most frequently voted in these pairwise classifications.
+```{r, include=FALSE}
+#lrn("classif.svm")$param_set
+
+svm_lrn <- lrn("classif.svm",
+               type = "C-classification",
+               kernel = "radial",
+               cost = to_tune(10, 20, logscale = TRUE),
+               gamma = to_tune(1e-4, 1, logscale = TRUE),
+               class.weights = c(Low = low_weight, Medium = medium_weight, High = high_weight))
+
+# use training set
+classif_task.train <- classif_task$clone()
+classif_task.train$filter(classif_splits$train)
+
+# tuner instance with training set
+svm_ti <- ti(task = classif_task.train,
+             learner = svm_lrn,
+             resampling = rsmp("cv", folds = 3),
+             measures = msr("classif.bacc"),  # balanced accuracy
+             terminator = trm("none"))
+
+
+# define search strategy
+svm_tuner <- tnr("grid_search")
+
+# initiate tuning process
+svm_tuner$optimize(svm_ti)
+```
+
+Final tuned parameters result
+```{r}
+# optimal hyperparameters from tuning
+svm_ti$result$learner_param_vals
+```
+
+```{r}
+autoplot(svm_ti, type = "surface")
+```
+### Training the optimized model on entire train data
+```{r}
+# create tuned model
+svm_tuned <- lrn("classif.svm", predict_type = "prob")
+svm_tuned$param_set$values = svm_ti$result_learner_param_vals
+
+# train tuned model with whole training partition
+svm_tuned$train(classif_task, classif_splits$train)
+```
+
+### Test on unseen data
+```{r}
+svm_tuned_prediction <- svm_tuned$predict(classif_task, 
+                                          row_ids = classif_splits$test)
+
+# autoplot(svm_tuned_prediction)
+svm_tuned_prediction$confusion
+svm_tuned_prediction$score(msrs(c("classif.ce", "classif.acc")))
+```
+
+Calculating precision and Recall manually:
+```{r}
+svm_confusion <- svm_tuned_prediction$confusion
+
+low_precision <- svm_confusion[1,1] / sum(svm_confusion[1,1:3])
+medium_precision <- svm_confusion[2,2] / sum(svm_confusion[2,1:3])
+high_precision <- svm_confusion[3,3] / sum(svm_confusion[3,1:3])
+
+low_recall <- svm_confusion[1,1] / sum(svm_confusion[1:3,1])
+medium_recall <- svm_confusion[2,2] / sum(svm_confusion[1:3,2])
+high_recall <- svm_confusion[3,3] / sum(svm_confusion[1:3,3])
+
+# macro average 
+macro_precision <- mean(c(low_precision, medium_precision, high_precision))
+macro_recall <- mean(c(low_recall, medium_recall, high_recall))
+
+cat('Precision scores: \n',
+    paste('Low:', round(low_precision,2)),'\n',
+    paste('Medium:', round(medium_precision,2)),'\n',
+    paste('High:', round(high_precision,2)),'\n',
+    paste('Average Precision:', round(macro_precision,2)),'\n\n')
+
+cat('Recall scores: \n',
+    paste('Low:', round(low_recall,2)),'\n',
+    paste('Medium: ', round(medium_recall,2)),'\n',
+    paste('High:', round(high_recall,2)),'\n',
+    paste('Average Recall:', round(macro_recall,2)))
+```
+
+Results have shown that this model performed well in predicting `Low`
+and `High` classes, but suffers when predicting the `Medium` class. This
+is expected, as games priced between 11 and 20 often exhibit
+characteristics of both expensive and inexpensive games, making
+predictions for this class more challenging.
+```{r}
+# Get the test data from the task
+test_data <- classif_task$data(rows = classif_splits$test)
+
+# get predictions as df
+predictions_df <- data.frame(
+  truth = svm_tuned_prediction$truth,
+  response = svm_tuned_prediction$response
+)
+
+# Combine test data with predictions
+combined_data <- dplyr::bind_cols(test_data, predictions_df)
+
+ggplot(combined_data, aes(x = daysReleased, y = logMedianPlaytime, color = response)) +
+  geom_point() +
+  labs(title = "Predicted Price Range",
+       color = "Price Range")
+ggplot(combined_data, aes(x = daysReleased, y = logMedianPlaytime, color = truth)) +
+  geom_point() +
+  labs(title = "Actual Price Range",
+       color = "Price Range")
+ggplot(combined_data, aes(x = logRecommendations, y = logMedianPlaytime, color = response)) +
+  geom_point() +
+  labs(title = "Predicted Price Range",
+       color = "Price Range") 
+```
+
+
+### Random Forest Classification
+
+The final optimized parameters are determined based on the
+classification logloss or the cross-entropy measure, which quantifies
+the difference between predicted probabilities and actual outcomes. This
+measure is chosen because it accounts for how confident the mistakes
+are, making it suitable for data that has class imbalance.
+```{r, include=FALSE}
+rpart_classif <- lrn("classif.ranger", 
+                     importance = "impurity",
+                     predict_type = "prob",                   
+                     num.trees = to_tune(c(10, 100, 500)),
+                     max.depth = to_tune(c(1, 30, 100)),
+                     min.node.size = to_tune(c(1, 2, 3, 4, 5)),
+                     class.weights = c(Low = low_weight, Medium = medium_weight, High = high_weight))
+
+rpart_classif_ti = ti(
+  task = classif_task.train,
+  learner = rpart_classif,
+  resampling = rsmp("cv", folds = 3),
+  measures = msr("classif.logloss"),  #classif.mauc_au1p: Weighted average 1 vs. 1 multiclass AUC
+  terminator = trm("none")
+)
+tuner <- tnr("grid_search")
+
+tuner$optimize(rpart_classif_ti)
+```
+
+Optimized tuning parameters:
+```{r}
+rpart_classif_ti$result_learner_param_vals
+```
+
+### Training optimized Random Forest model on whole training partition
+```{r}
+rforest_classif_tuned <- lrn("classif.ranger")
+
+# train model with tuned hyperparameters
+rforest_classif_tuned$param_set$values = rpart_classif_ti$result_learner_param_vals
+
+rforest_classif_tuned$train(classif_task, classif_splits$train)
+```
+
+### Feature importance
+
+Ranking the feature's importance based on the decrease in node impurity
+when a feature is used to split a node.
+
+```{r}
+# Extract importance and convert to data.frame
+rpart_importance <- data.frame(
+  feature = names(rforest_classif_tuned$importance()),
+  importance = unname(rforest_classif_tuned$importance())
+)
+
+# Sort features by importance (descending)
+rpart_importance <- rpart_importance %>%
+  arrange(desc(importance))
+print(rpart_importance)
+```
+Plot importance
+```{r}
+ggplot(rpart_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +  # Bar color
+  coord_flip() +  # Horizontal bars for readability
+  labs(
+    title = "Feature Importance in Random Forest",
+    x = "Feature",
+    y = "Importance Score"
+  ) +
+  theme_minimal()
+```
+
+### Visualize top 5 features with decision tree
+```{r}
+classif_rpart_lrn <- lrn("classif.rpart")
+
+classif_rpart_subset <- classif_task$clone()
+
+#look at how top 5 features from rforest would be plotted
+classif_rpart_subset$select(names(head(rforest_classif_tuned$importance(),5)))
+
+classif_rpart_lrn$train(classif_rpart_subset, row_ids = classif_splits$train)
+suppressWarnings(
+rpart.plot(classif_rpart_lrn$model)
+)
+```
+### Test results
+```{r}
+rforest_classif_prediction <- rforest_classif_tuned$predict(classif_task, classif_splits$test)
+
+rforest_classif_prediction$confusion
+rforest_classif_prediction$score(msrs(c("classif.ce", "classif.acc")))
+```
+Visualize prediction using important features
+```{r}
+# Get the test data from the task
+test_data <- classif_task$data(rows = classif_splits$test)
+
+# get predictions as df
+predictions_df <- data.frame(
+  truth = rforest_classif_prediction$truth,
+  response = rforest_classif_prediction$response
+)
+
+# Combine test data with predictions
+combined_data <- dplyr::bind_cols(test_data, predictions_df)
+
+ggplot(combined_data, aes(x = daysReleased, y = logMedianPlaytime, color = response)) +
+  geom_point() +
+  labs(title = "Predicted Price Range",
+       color = "Price Range")
+ggplot(combined_data, aes(x = daysReleased, y = logMedianPlaytime, color = truth)) +
+  geom_point() +
+  labs(title = "Actual Price Range",
+       color = "Price Range")
+
+# look at cluster 4 weight
+ggplot(combined_data, aes(x = X4, y = logMedianPlaytime, color = response)) +
+  geom_point() +
+  labs(color = "Predicted Price Range") 
+```
+
+Precision and Recall scores for each class
+```{r}
+rforest_confusion <- rforest_classif_prediction$confusion
+
+low_precision <- rforest_confusion[1,1] / sum(rforest_confusion[1,1:3])
+medium_precision <- rforest_confusion[2,2] / sum(rforest_confusion[2,1:3])
+high_precision <- rforest_confusion[3,3] / sum(rforest_confusion[3,1:3])
+
+low_recall <- rforest_confusion[1,1] / sum(rforest_confusion[1:3,1])
+medium_recall <- rforest_confusion[2,2] / sum(rforest_confusion[1:3,2])
+high_recall <- rforest_confusion[3,3] / sum(rforest_confusion[1:3,3])
+
+# macro average 
+macro_precision <- mean(c(low_precision, medium_precision, high_precision))
+macro_recall <- mean(c(low_recall, medium_recall, high_recall))
+
+cat('Precision scores: \n'
+  ,paste('Low:', round(low_precision,2)),'\n'
+  ,paste('Medium:', round(medium_precision,2)),'\n'
+  ,paste('High:', round(high_precision,2)),'\n'
+  ,paste('Average Precision:', round(macro_precision,2)),'\n\n')
+
+cat('Recall scores: \n'
+  ,paste('Low:', round(low_recall,2)),'\n'
+  ,paste('Medium: ', round(medium_recall,2)),'\n'
+  ,paste('High:', round(high_recall,2)),'\n'
+  ,paste('Average Recall:', round(macro_recall,2)))
+```
+
+
+
+
+
+
+

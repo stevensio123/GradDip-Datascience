@@ -1,0 +1,1002 @@
+---
+title: "Part 2"
+author: "StevenSio"
+date: "2025-02-17"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: kable
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import libraries
+```{r}
+library(dplyr)
+library(skimr)
+library(tidyr)
+library(readr)
+library(corrplot)
+library(ggplot2)
+library(lubridate)
+library(RColorBrewer)
+library(mlr3learners)
+library(mlr3viz)
+library(mlr3pipelines)
+library(mlr3tuning)
+library(viridis)
+library(stringr)
+library(pROC)
+```
+
+
+### Import data
+Import combined data if available, else import raw data and combine them,
+and then export the combined data into new csv for future usage.
+
+```{r}
+library(data.table)
+
+# Define column types
+col_classes <- c(
+  Year = "integer",
+  Month = "integer",
+  DayofMonth = "integer",
+  DayOfWeek = "integer", 
+  DepTime = "integer",
+  CRSDepTime = "integer",
+  ArrTime = "integer",
+  CRSArrTime = "integer",
+  UniqueCarrier = "factor",
+  FlightNum = "integer",
+  TailNum = "factor",
+  ActualElapsedTime = "integer",
+  CRSElapsedTime = "integer",
+  AirTime = "integer",
+  ArrDelay = "integer",
+  DepDelay = "integer",
+  Origin = "factor",
+  Dest = "factor",
+  Distance = "integer",
+  TaxiIn = "integer",
+  TaxiOut = "integer",
+  Cancelled = "integer",
+  CancellationCode = "factor",
+  Diverted = "integer",
+  CarrierDelay = "integer",
+  WeatherDelay = "integer",
+  NASDelay = "integer",
+  SecurityDelay = "integer",
+  LateAircraftDelay = "integer"
+)
+
+if (file.exists("combined_data.csv")) {
+  # Read combined data if exists
+  flight_df <- fread("combined_data.csv", colClasses = col_classes)
+  cat("\nImported combined_data.csv, rows:", nrow(flight_df), 
+      "Years available:", toString(unique(flight_df$Year)), "\n")
+} else {
+  # Read and combine year data
+  all_data <- list()
+  for (year in 2003:2007) {
+    dt <- fread(
+      paste0(year, ".csv"),
+      select = names(col_classes),
+      colClasses = col_classes
+    )
+    all_data <- c(all_data, list(dt))
+    cat(year, "data processed\n")
+  }
+  
+  # Combine all data and save
+  flight_df <- rbindlist(all_data, use.names = TRUE)
+  fwrite(flight_df, "combined_data.csv")
+  cat("\nCreated combined_data.csv with", nrow(flight_df), 
+      "rows. Years:", toString(unique(flight_df$Year)), "\n")
+}
+```
+
+```{r}
+dim(flight_df)
+```
+```{r}
+head(flight_df)
+```
+```{r}
+#unique(flight_df$CancellationCode)
+unique(flight_df$DayOfWeek)
+```
+- `DayOfWeek` is a numeric variable, I will convert it into a factor.
+```{r}
+# convert DayOfWeek to factor
+flight_df$DayOfWeek <- factor(flight_df$DayOfWeek,
+                              levels = 1:7)
+```
+### Part 2a
+For part 2a, we are interested in finding the best days of the week and time to minimize delays of each year. The following shows step by step how could this question be answered.
+
+Since we are only interested in flight delays for flights that actually took of, only flights that are not cancelled will be included.
+```{r}
+
+# Filter out cancelled flights
+flight_df.filtered <- flight_df %>%
+  filter(Cancelled == 0)
+
+dim(flight_df.filtered)
+table(flight_df.filtered$Cancelled)
+```
+There are six features related to flight delays: ArrDelay, DepDelay, CarrierDelay, WeatherDelay, NASDelay, SecurityDelay, and LateAircraftDelay. 
+
+Due to the size of this dataset, I will randomly select 1000,000 rows to inspect the approximate condition of the data with the `skim()` function, the full data is too large and infeasible to run this function for my computer.
+
+```{r}
+set.seed(1)
+sample_index <- sample(nrow(flight_df.filtered),1000000)
+
+# skim through 1000000 rows of randomly sampled data
+skim(flight_df.filtered[sample_index,c('ArrDelay','DepDelay','CarrierDelay','NASDelay','SecurityDelay','LateAircraftDelay','WeatherDelay')])
+```
+
+There are some missing values in these features, and some negative values in `NASDelay`, `ArrDelay` and `DepDelay`. It could be the case that the negative values meant that the flight was arrived or departed earlier than scheduled, since information were not given, I will assume missing values meant no delay (0) and negative values meant early arrival or departure, the latter case of observations would not be included for this problem.
+
+I will proceed to replace missing values for delays to zero, and filter out negative values for delays.
+```{r}
+# replace na delay to zero
+# filter out observations with negative delays
+
+flight_df.filtered <- replace_na(flight_df.filtered, list(
+  ArrDelay = 0,
+  DepDelay = 0,
+  NASDelay = 0,
+  CarrierDelay = 0,
+  SecurityDelay = 0,
+  WeatherDelay = 0,
+  LateAircraftDelay = 0
+)) %>%  
+  filter(
+  ArrDelay >= 0,
+  DepDelay >= 0,
+  NASDelay >= 0,
+  CarrierDelay >= 0,
+  SecurityDelay >= 0,
+  WeatherDelay >= 0,
+  LateAircraftDelay >= 0
+  )
+```
+
+### TotalDelay
+I will create a new variable `TotalDelay` which sums up all types of delay.
+```{r}
+flight_df.filtered <- flight_df.filtered %>%
+  mutate(TotalDelay = ArrDelay + DepDelay + NASDelay + CarrierDelay + SecurityDelay + LateAircraftDelay + WeatherDelay)
+```
+
+
+### Delay Summary
+
+I will first group data by `Year`, `DayOfWeek`, and `CRSDepTime`, and aggregate total delay to its mean value. Missing values will be excluded if still present.
+```{r}
+# group by Year and DayOfWeek
+delay_summary <- flight_df.filtered %>%        
+  group_by(Year, DayOfWeek, CRSDepTime) %>%
+  summarise(avg_TotalDelay = mean(TotalDelay, na.rm = TRUE)) %>%
+  ungroup()
+
+head(delay_summary)
+```
+```{r}
+delay_scat <- ggplot(delay_summary) +
+  geom_point(aes(x = CRSDepTime, y = avg_TotalDelay), size = 0.8, alpha = 0.5)  +
+  labs(title = "Average Total Delays in different Time",  
+       x = "Scheduled Departure Time (HHMM) \nGrouped by days of week",  
+       y = "Average Total Delay (minutes)")  
+
+delay_scat + facet_grid(Year ~ DayOfWeek) +
+  scale_x_continuous(labels = function(x) sprintf("%04d", x)) +  # Format x-axis labels as four digits
+  scale_y_continuous(limits = c(0, 300)) +  # Limit y-axis to values up to 300
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+```
+The upside-down U curve in average total delay for different time throughout the day shows that there are two points in time for each day where the average total delay is minimized. Note that the Y-axis is limited to show points with average total delay up to 300 minutes only.
+
+I will proceed to find which time results in the lowest average total delay for each day of the week in each year.
+```{r}
+# CRSDepTime with lowest average total delay for each Year and DayOfWeek
+best_day_time <- delay_summary %>%
+  group_by(Year, DayOfWeek) %>%
+  slice_min(avg_TotalDelay, n = 1) %>%  # row with lowest n value for avg_TotalDelay
+  ungroup()
+
+print(best_day_time)
+```
+It is not yet clear which day of the week would have lower flight delays on average, since only the minimal average total delay by the exact minutes is shown, this data is ignoring what the average total delay will be at a higher, less detailed level. I will now find what the average total delay for the whole day is for each day of the week.
+
+```{r}
+delay_summary_WeekDay <-  flight_df.filtered %>%        
+  group_by(Year, DayOfWeek) %>%
+  summarise(avg_TotalDelay = mean(TotalDelay, na.rm = TRUE)) %>%
+  ungroup()
+
+head(delay_summary_WeekDay)
+```
+### Final Summary Plot
+To summarize it all, I will plot the overall average of total delay for the whole day as a orange line, and the exact scheduled departure time that results in the lowest total delays as a red line. 
+
+```{r}
+# Final plot
+delay_scat.final <- delay_scat +
+  geom_point(data = best_day_time, 
+             aes(x = CRSDepTime, y = avg_TotalDelay), 
+             color = "red", size = 3) +
+  geom_vline(data = best_day_time, 
+             aes(xintercept = CRSDepTime), 
+             color = "red", linetype = "solid", size = 0.2) +
+  #geom_label(data = best_day_time, 
+  #           aes(x = CRSDepTime, y = 170, label = sprintf("%04d", CRSDepTime)),
+  #           color = "red", alpha = 0.9, size = 3, angle = 90) + 
+  geom_hline(data = delay_summary_WeekDay, 
+             aes(yintercept = avg_TotalDelay, group = DayOfWeek), 
+             color = "orange", linetype = "dashed", size = 1) + # whole day average
+  geom_label(data = delay_summary_WeekDay, aes(x = 1350, y = avg_TotalDelay, group = DayOfWeek, label = paste("Delay:", round(avg_TotalDelay, 0), sep = "")),
+             color = "brown", size = 3, angle = 0) +
+  facet_grid(Year ~ DayOfWeek) +
+  scale_x_continuous(labels = function(x) sprintf("%04d", x)) +  # Format x-axis labels as four digits
+  scale_y_continuous(limits = c(0, 300)) +  # Limit y-axis to values up to 300
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+plot(delay_scat.final)
+
+# Save the plot 
+ggsave("delay_scat_final.png", plot = delay_scat.final, width = 10, height = 8, dpi = 300)
+```
+The red point along with the vertical red line shows which point in time for each day of the week results in the lowest average total delay. It is shown that the time between 11:00pm and 5:30am have consistently resulted in near-zero average total delays for all days of the week in all years. 
+
+The orange line representing the average delays in the whole day for different weekdays shows that Saturdays have the lowest average total delay out of all weekdays for years 2003 to 2007. For 2008, it was not as clear which day has lower delays since they are at a very similar level, but Wednesdays has slightly lower total delay than all other weekdays on average.
+
+
+### Part 2b
+For part 2b, we are interested in finding out whether older planes have more delays each year. To answer this question. The following shows step by step how I approach this question.
+
+Import plane data
+```{r}
+plane_df <- read_csv("plane-data.csv")
+skim(plane_df)
+```
+```{r}
+plane_df[is.na(plane_df$type),]
+```
+There are 549 planes with missing data across all columns except for `tailnum`, I will remove these observations as there are no usable information here.
+
+```{r}
+plane_df.filtered <- plane_df[!is.na(plane_df$type),]
+
+skim(plane_df.filtered)
+```
+```{r}
+head(plane_df.filtered)
+```
+```{r}
+unique(plane_df.filtered$manufacturer)
+```
+```{r}
+barplot(table(plane_df.filtered$engine_type), las=2, main = 'Engine Type frequency')
+```
+```{r}
+plane_df.filtered[plane_df.filtered$engine_type == 'None',]
+```
+
+```{r}
+table(plane_df.filtered$status)
+```
+
+There are 3 planes with 'None' as engine type, and one plane with `status` not valid, I will remove them.
+```{r}
+plane_df.filtered <- plane_df.filtered %>% filter(engine_type != 'None' & status == 'Valid')
+```
+```{r}
+head(plane_df.filtered[,c('year','issue_date')],20)
+```
+As there were no documentation explaining what is meant by `issue_date` or `year`, I will assume the `year` column contains information about the manufactured year of a plane, and `issue_date` is when the plane has officially entered service, since based on observation, the `year` is always before `issue_date` in this dataset. 
+
+I will convert some variables into factor type, and remove some features that may not be relevant for subsequent analysis.
+```{r}
+plane_df.filtered <- plane_df.filtered %>% 
+  select(-c('manufacturer','model','status','issue_date'))
+
+# convert to factor
+plane_df.filtered$type <- factor(plane_df.filtered$type)
+plane_df.filtered$engine_type <- factor(plane_df.filtered$engine_type)
+plane_df.filtered$aircraft_type <- factor(plane_df.filtered$aircraft_type)
+```
+
+
+
+```{r}
+table(plane_df.filtered$year)
+```
+There are some planes with `year` as 0000 and None, I will remove those observations. After removing, I will convert `year` into a numeric variable for easier data processing and analysis later.
+```{r}
+# Filter out None and 000 from year
+plane_df.filtered <- plane_df.filtered %>% filter(year != '0000' & year != 'None')
+
+# Convert to numeric
+plane_df.filtered$year <- as.numeric(plane_df.filtered$year)
+
+hist(plane_df.filtered$year, main = 'Planes Manufactured by Years', xlab = 'Year',breaks = 30)
+```
+The column `TailNum` from the flight data and `tailnum` from the plane data can be used as key index to join both sides of the data and select the needed features for this problem. Since this question requires both information of the flights and the plane data, I will use an inner-join method to make sure both sides of the data are present.
+
+The same filtered and cleaned flight data from part 2a will be used in this part.
+```{r}
+flight_plane <- inner_join(flight_df.filtered, 
+                          plane_df.filtered, by = c("TailNum" = "tailnum"))
+
+head(flight_plane)
+```
+I will use the `year` column from the plane data to calculate the age of a plane as of its departure date in the flight data (`Year` - `year`).
+-  `Year` is from the flight data, represents year of flight departure.
+-  `year` is from the plane data, represents manufacture year of a plane.
+
+```{r}
+flight_plane <- flight_plane %>% mutate(PlaneAge = Year - year)
+
+summary(flight_plane$PlaneAge)
+
+flight_plane[flight_plane$PlaneAge < 0,]
+```
+There are some observations with `PlaneAge` below zero, which means the manufactured `year` from plane data is more recent than the `Year` of flight departure from the flight data. More information may be needed to explain the reasons behind this. For now, I will exclude these observations and proceed with the next steps of the analysis.
+```{r}
+# filter out negative plane age
+flight_plane.filtered <- flight_plane %>% filter(PlaneAge >= 0)
+
+summary(flight_plane.filtered$PlaneAge)
+```
+```{r}
+hist(flight_plane.filtered$PlaneAge, breaks = 40, main = "Distribution of Plane Age", xlab = 'Plane Age')
+```
+Line plot of average total delays by plane age
+```{r}
+# Group by PlaneAge and calculate the mean of TotalDelay
+planeAge_summary <- flight_plane.filtered %>%
+  group_by(PlaneAge) %>%
+  summarise(AvgTotalDelay = mean(TotalDelay, na.rm = TRUE)) %>%
+  ungroup()  # Remove grouping to make sure it doesn't affect subsequent operations
+
+# Plot the line chart
+ggplot(planeAge_summary, aes(x = PlaneAge, y = AvgTotalDelay)) +
+  geom_line() +
+  labs(x = "Plane Age", y = "Average Total Delay",
+       title = "Trend of Overall Average Total Delay by Plane Age") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(size = 17))  # Set font sizes for labels and title
+```
+Same plot, for each year individually
+```{r}
+# Create a new data frame to store all year plots
+all_year_plots <- data.frame()
+
+# Loop over each unique year
+for (i in unique(flight_plane.filtered$Year)) {
+  # Subset data for the current year
+  year_subset <- flight_plane.filtered %>% filter(Year == i)
+  
+  # Group by PlaneAge and calculate the mean of TotalDelay
+  planeAge_summary <- year_subset %>%
+    group_by(PlaneAge) %>%
+    summarise(AvgTotalDelay = mean(TotalDelay, na.rm = TRUE)) %>%
+    ungroup()  # Remove grouping to make sure it doesn't affect subsequent operations
+  
+  # Add a column for the year to the summary data frame
+  planeAge_summary$Year <- i
+  
+  # Bind the current year's data to the all_year_plots data frame
+  all_year_plots <- rbind(all_year_plots, planeAge_summary)
+}
+
+# Plot the line chart
+ggplot(all_year_plots, aes(x = PlaneAge, y = AvgTotalDelay, color = as.factor(Year))) +
+  geom_line() +
+  labs(x = "Plane Age", y = "Average Total Delay",
+       title = "Trend of Total Delay by Plane Age (2003-2007 Average)") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(size = 17),
+        legend.title = element_text(size = 11)) +
+  scale_color_discrete(name = "Year")  # Add legend title
+```
+Most of the planes has operated for under 10 years as of their departure year. There are not much planes over 20 years old. There appears to be an upward trend of average total delays as plane age increases. Additionally, there are spikes in average total delay observed at approximately every 10-year interval (ages 10, 20, 30, 40, and 50).
+
+To better highlight these spikes in delay for plane age near the boundaries of the intervals, I will create a new categorical from the `PlaneAge` variable by cutting it into 4 levels of age, 0-5, 6-10, 11-20, and 21+ using the `cut()` method from pandas. I will then create boxplots to visualize the average levels of delay of planes under these 4 levels of plane age.
+```{r}
+flight_plane.filtered$PlaneAgeCategory <- cut(flight_plane.filtered$PlaneAge, 
+                           breaks = c(0, 7, 12, 17, 22, 27, 32, 37, 42, 47, 50), 
+                           labels = c("0-7", "8-12", "13-17", "18-22", "23-27", "28-32", "33-37", "38-42", "43-47", "48-50"),
+                           right = TRUE)
+
+table(flight_plane.filtered$PlaneAgeCategory)
+```
+Correlation between plane age and total delay
+```{r}
+# Calculate the correlation between PlaneAge and TotalDelay
+corr_value <- cor(flight_plane.filtered$PlaneAge, flight_plane.filtered$TotalDelay)
+
+# Create the boxplot with ggplot2
+p <- ggplot(flight_plane.filtered, aes(x = PlaneAgeCategory, y = TotalDelay)) +
+  geom_boxplot(outlier.shape = NA) +  # Remove outliers
+  labs(y = 'Total Delay',
+       title = paste('All Years Combined,\n Corr(PlaneAge,TotalDelay) = ', round(corr_value, 3))) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45),  # Rotate x-axis labels
+        plot.title = element_text(hjust = 0.5)) + # Center the title
+  ylim(0,400) # adjust y-axis range
+# Print the plot
+print(p)
+```
+The boxplot and the low correlation coefficient value between TotalDelay and PlaneAge for all years combined suggest that there is little linear correlation between plane age and total delays. 
+
+To further investigate the correlation between these two variables each year, I will create separate plots and compute the correlation coefficient for each year individually.
+```{r}
+for (i in unique(flight_plane.filtered$Year)) {
+  # subset the data to specified year
+  year_subset <- flight_plane.filtered[flight_plane.filtered$Year == i,
+                                       c('PlaneAge','PlaneAgeCategory','TotalDelay')]
+  
+  # Calculate the correlation between PlaneAge and TotalDelay
+  corr_value <- cor(year_subset$PlaneAge, year_subset$TotalDelay)
+  
+  # Create the boxplot with ggplot2
+  p <- ggplot(year_subset, aes(x = PlaneAgeCategory, y = TotalDelay)) +
+    geom_boxplot(outlier.shape = NA) +  # Remove outliers
+    labs(y = 'Total Delay',
+         title = paste('All Years Combined' , i,'\n Corr(PlaneAge,TotalDelay) = ', round(corr_value, 3))) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45),  # Rotate x-axis labels
+          plot.title = element_text(hjust = 0.5)) + # Center the title
+    ylim(0,400) # adjust y-axis range
+  # Print the plot
+  print(p)
+}
+```
+When separated into individual years, the correlation between `TotalDelay` and `PlaneAge` remains close to zero. Additionally, the boxplots for different plane age categories show mean and quartile ranges that are nearly the same across each year despite a upward trend observed in previous line plot. This suggests that while plane age doesn’t have a clear linear connection to delays, extreme delays in older planes (e.g., 10, 20, or 30 years old) can occasionally push up the average, even though the overall pattern remains stable.
+
+### Part 2c
+For this part, we are interested in predicting the probability of diverted flights given some selected features in a logistic regression model. 
+
+I will begin by investigating the carriers data and airports data. The data from part b `flight_plane.filtered`, which has already filtered out cancelled flights, flights with negative plane age, and flights with no plane data, will be used to join both the carriers and airports data.
+```{r}
+# import data
+airport_df <- read_csv('airports.csv')
+carriers_df <- read_csv('carriers.csv')
+```
+```{r}
+head(airport_df)
+```
+```{r}
+head(carriers_df)
+```
+Rename 'Description' as 'CarrierName'
+```{r}
+carriers_df <- carriers_df %>% rename(CarrierName = Description)
+```
+
+```{r}
+head(flight_plane.filtered)
+```
+Based on observation, the variables `Origin` and `Dest` from the flights data and `iata` from the airports data can be used as common keys to join these datasets. Additionally, the `Code` variable from the carriers data and the `UniqueCarrier` variable from the flights data are also matching keys that can be used to join these datasets together.
+
+I will add in `lat` and `long` from airports data to provide coordinates of Origin and Destination airports in the flight data. The extra description from the carrier data will not be used because I did not find it useful in anyway for this part.
+```{r}
+# First join for Origin data
+flight_plane_airport <- left_join(flight_plane.filtered, 
+                          airport_df[,c('iata','lat','long')], 
+                          by = c("Origin" = "iata"))
+
+# Second join for Destination data
+flight_plane_airport <- left_join(flight_plane_airport, 
+                          airport_df[,c('iata','lat','long')], 
+                          by = c("Dest" = "iata"),
+                          suffix = c("","_dest")) # set suffix for 2nd dataset col names
+
+# join for carrier description/name
+flight_plane_airport <- left_join(flight_plane_airport, 
+                          carriers_df[,c('Code','CarrierName')], 
+                          by = c("UniqueCarrier" = "Code"))
+
+head(flight_plane_airport)
+```
+
+```{r}
+table(flight_plane_airport$Diverted)
+```
+There are significant class imbalance in the target variable. 
+
+### Carrier impact on divertion
+`UniqueCarrier` will be converted into a factor variable. The following table summarises the average carrier delay based on different carriers.
+```{r}
+flight_plane_airport$UniqueCarrier <- as.factor(flight_plane_airport$UniqueCarrier)
+#flight_plane_airport$CarrierName <- as.factor(flight_plane_airport$CarrierName)
+
+carrier_delay <- flight_plane_airport %>% 
+  group_by(Year, UniqueCarrier, CarrierName) %>%
+  summarise(DivertedCount = sum(Diverted),
+            DivertedPct = mean(Diverted)) %>%
+  arrange(desc(DivertedCount))
+
+print(head(carrier_delay))
+```
+It is mentioned in the carrier description that America West Airlines Inc. and US Airways Inc. have merged in 9/05 (Sep, 2005), which means flight records with carrier belonging to these two airlines should have the same Carrier name after this date. I will proceed to Rename these carriers to 'US/America West merged'.
+
+First I have to derive a new datetime variable in POSIXct format using the 'Year', 'Month', 'DayofMonth', and 'DepTime' variables together.
+``` {r}
+# Convert time variables to POSIXct format
+flight_plane_airport$DepTime.dt <- as.POSIXct(
+  paste(sprintf("%04d",flight_plane_airport$Year),
+        sprintf("%02d",flight_plane_airport$Month),
+        sprintf("%02d",flight_plane_airport$DayofMonth),
+        substr(sprintf("%04d",flight_plane_airport$DepTime),1,2),  # extract hours
+        substr(sprintf("%04d",flight_plane_airport$DepTime),3,4),  # extract minutes
+        sep="-"), 
+  format = "%Y-%m-%d-%H-%M")
+
+# check result
+head(flight_plane_airport[,c('DepTime.dt','Year','Month','DayofMonth','DepTime')])
+```
+ Rename carriers to 'US/America West merged' based on specified condition.
+```{r}
+# 1. Merge the two carriers if the departure date is on/after 2005-09-01.
+# 2. For departures before 2005-09-01, set the US Airways name.
+# 3. For departures before 2005-09-01, set the America West name.
+flight_plane_airport <- flight_plane_airport %>% 
+  mutate(CarrierName = ifelse(DepTime.dt >= as.Date("2005-09-01") &
+                                (CarrierName %in% c('US Airways Inc. (Merged with America West 9/05. Reporting for both starting 10/07.)', 
+                                                    'America West Airlines Inc. (Merged with US Airways 9/05. Stopped reporting 10/07.)')),
+                              'US/America West merged', CarrierName)) %>%
+    mutate(CarrierName = ifelse(DepTime.dt < as.Date("2005-09-01") &
+                                (CarrierName %in% 'US Airways Inc. (Merged with America West 9/05. Reporting for both starting 10/07.)'),'US Airways Inc.', CarrierName)) %>%
+    mutate(CarrierName = ifelse(DepTime.dt < as.Date("2005-09-01") &
+                                (CarrierName %in% 'America West Airlines Inc. (Merged with US Airways 9/05. Stopped reporting 10/07.)'),'America West Airlines Inc.', CarrierName))
+
+# update carrier_delay summary
+carrier_delay <- flight_plane_airport %>% 
+  group_by(Year, UniqueCarrier, CarrierName) %>%
+  summarise(DivertedCount = sum(Diverted),
+            DivertedPct = mean(Diverted)) %>%
+  arrange(desc(DivertedCount))
+
+print(head(carrier_delay))
+```
+Plot summary
+```{r}
+for (i in 2003:2007) {
+  # create horiz barplot for each year
+  p <- ggplot(carrier_delay[carrier_delay$Year == i,], 
+              aes(x = DivertedPct, y = reorder(CarrierName, DivertedPct), 
+                  fill = factor(Year))) +
+    geom_col() +  # Horizontal bar plot
+    labs(title = paste("Percentage of Diverted Flights by Carrier in", i),
+         x = "Diverted Percentage",
+         y = "Carrier Name") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  # Display the plot
+  print(p)
+}
+```
+It is shown that most carriers have diversion rate below 0.4%, while JetBlue Airways (B6) and Expressjet Airlines (XE) have well above 0.5% diversion rate in 2006-2007. These two carriers were also quite often on the top of the list in terms of diverted flight percentage from 2003-2007.
+
+### Distance impact on divertion
+```{r}
+flight_plane_airport %>%
+  group_by(Year, Diverted) %>% 
+  summarise(distance = mean(Distance)) %>%
+  arrange(desc(Year))
+```
+For all the years, distance for diverted flights were consistently higher on average than flights that were not diverted.
+
+### Month and Day of Week impact on divertion
+I will first create `MonthAbb` by using `Month` as a factor of 12 levels with month abbreviations as their labels.
+```{r}
+flight_plane_airport <- flight_plane_airport %>% mutate(MonthAbb = factor(Month, levels = 1:12, labels = month.abb))
+```
+
+
+```{r}
+diverted_summary <- flight_plane_airport %>% 
+  group_by(Year, MonthAbb, DayOfWeek) %>%
+  summarise(Flights = n(), 
+            Diverted = sum(Diverted),
+            DivertedPct = sum(Diverted) / n()) 
+print(diverted_summary)
+```
+Summary Plot
+```{r}
+# Small multiple
+ggplot(diverted_summary, aes(fill=DayOfWeek, y=DivertedPct, x=MonthAbb)) + 
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of Flights that are diverted (Stacked)",  
+       x = "Month",  
+       y = "Percentage of all Flights") +
+    facet_grid(~Year) +
+    theme(axis.text.x = element_text(angle = 90))
+
+```
+For 2003-2007, Jun-Aug and Dec-Jan have consistently resulted in more flights as well as higher percentage of diverted flights, I will create a dummy variable `HotMonth` to indicate flights taken in [Jun, Jul, Aug], and `ColdMonth` to indicate flights taken in [Dec, Jan] whether the flight is taken in these months.
+```{r}
+flight_plane_airport <- flight_plane_airport %>% 
+  mutate(HotMonth = ifelse(MonthAbb %in% c("Jun", "Jul", "Aug"), 1, 0)) %>%
+  mutate(ColdMonth = ifelse(MonthAbb %in% c("Dec", "Jan"), 1, 0))
+```
+
+
+```{r}
+skim(flight_plane_airport[flight_plane_airport$Diverted == 1,])
+```
+There are some features with absolutely no data for diverted flights, including: `ArrTime`, `ActualElapsedTime` and `AirTime`. These features will therefore not be included in the logistic regression model.
+
+`TaxiIn` and `CRSElapsedTime` also contains some missing data, these observations will be imputed by their mean values.
+
+I will also exclude some other irrelevant features including: `Cancelled`, `CancellationCode`, `Dest`, `Origin`, `TailNum` and `FlightNum`
+```{r}
+# Calculate the mean of `TaxiIn` and `CRSElapsedTime`, ignoring NA values
+TaxiInMean <- mean(flight_plane_airport$TaxiIn, na.rm = TRUE)
+CRSElapsedMean <- mean(flight_plane_airport$CRSElapsedTime, na.rm = TRUE)
+
+# Replace NA values with the mean
+flight_plane_airport$TaxiIn[is.na(flight_plane_airport$TaxiIn)] <- TaxiInMean
+flight_plane_airport$CRSElapsedTime[is.na(flight_plane_airport$CRSElapsedTime)] <- CRSElapsedMean
+
+# Exclude some of the features
+flight_plane_airport <- flight_plane_airport %>%
+  select(-c('AirTime','ActualElapsedTime','ArrTime','Cancelled', 'CancellationCode', 'Dest', 'Origin','TailNum','FlightNum'))
+```
+
+```{r}
+dim(flight_plane_airport)
+```
+Randomly pick 1,000,000 rows to check/skim overall data quality. This method is used only due to limitations in computer memory.
+```{r}
+set.seed(1)
+sample_index <- sample(nrow(flight_plane_airport), 1000000)
+skim(flight_plane_airport[sample_index,])
+```
+There are some observations with negative `CRSElapsedTime`, I will assume those were corrupt data and exclude them.
+```{r}
+flight_plane_airport <- flight_plane_airport[flight_plane_airport$CRSElapsedTime >= 0,]
+```
+
+### Engine type impact on diversion
+```{r}
+engine_summary <- flight_plane_airport %>% 
+    group_by(Year, engine_type) %>%  
+    summarise(Diverted = sum(Diverted),
+              Flights = n(),
+              DivertedPctWithin = Diverted/Flights) %>%
+    ungroup() %>%
+    group_by(Year) %>%
+    mutate(DivertedPctOverall = (Diverted / sum(Diverted))) %>%  # Calculate percentage
+    ungroup()
+print(engine_summary)
+```
+Summary plots
+```{r}
+# summary plot proportion of diverted counts overall
+ggplot(engine_summary, aes(fill=engine_type, y=DivertedPctOverall, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+  geom_text(aes(label = round(DivertedPctOverall,2))) +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of All Diverted flights by engine type",  
+       x = "Year",  
+       y = "Diverted Flights Overall Proportion") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+```{r}
+# summary of diverted proportion within each type
+ggplot(engine_summary, aes(fill=engine_type, y=DivertedPctWithin, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of Diverted flights within each Engine Type",  
+       x = "Year",  
+       y = "Diverted Flights Proportion") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+Of all diverted flights, planes with Turbo-Fan accounts to more than 50% of them, while Turbo-Jet accounts for more than 30% of diverted flights each year. However, turbo fan and jet type aircraft engine have very consistant diversion rate across all years, where as all other aircraft engines have higher fluctuations, I will create an indicator variable to indicate whether the plane engine has turbo-jet or turbo-fan ('TurboEngine')
+
+```{r}
+# grepl() checks if engine_type starts with "Turbo"
+flight_plane_airport <- flight_plane_airport %>%
+  mutate(TurboEngine = ifelse(engine_type %in% c('Turbo-Jet','Turbo-Fan'), 1, 0))
+```
+
+
+### Aircraft type impact on diversion
+```{r}
+aircraft_summary <- flight_plane_airport %>% 
+    group_by(Year, aircraft_type) %>%  
+    summarise(Diverted = sum(Diverted),
+              Flights = n(),
+              DivertedPctWithin = Diverted/Flights) %>%
+    ungroup() %>%
+    group_by(Year) %>%
+    mutate(DivertedPctOverall = (Diverted / sum(Diverted))) %>%  # Calculate percentage
+    ungroup()
+print(aircraft_summary)
+```
+Summary plot
+```{r}
+# Small multiple
+ggplot(aircraft_summary, aes(fill=aircraft_type, y=DivertedPctOverall, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+  geom_text(aes(label = round(DivertedPctOverall,2))) +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "ercentage of All Diverted flights by aircraft type",  
+       x = "Year",  
+       y = "Percentage of all diverted flights") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+```{r}
+# Small multiple
+ggplot(aircraft_summary, aes(fill=aircraft_type, y=DivertedPctWithin, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of Diverted flights within each Aircraft Type",  
+       x = "Year",  
+       y = "Diverted Flights Percentage") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+Basically all diverted flights have 'Fixed Wing Multi-Engine' type because other type of aircraft have a lot less flights. However, of all aircraft types, Rotorcraft and Fixed Wing Single-Engine aircrafts are inconsistently more prone to flight diversion. A new indicator variable 'NotMultiEngine' was created to indicate planes that are not multi engine type for the flight
+```{r}
+flight_plane_airport <- flight_plane_airport %>%
+  mutate(MultiEngine = ifelse(aircraft_type == 'Fixed Wing Multi-Engine', 1, 0))
+
+table(flight_plane_airport$MultiEngine)
+```
+
+
+### Flight type impact on diversion
+```{r}
+type_summary <- flight_plane_airport %>% 
+    group_by(Year, type) %>%  
+    summarise(Diverted = sum(Diverted),
+              Flights = n(),
+              DivertedPctWithin = Diverted/Flights) %>%
+    ungroup() %>%
+    group_by(Year) %>%
+    mutate(DivertedPctOverall = (Diverted / sum(Diverted))) %>%  # Calculate percentage
+    ungroup()
+print(type_summary)
+```
+Summary plot
+```{r}
+# Small multiple
+ggplot(type_summary, aes(fill=type, y=DivertedPctOverall, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+  geom_text(aes(label = round(DivertedPctOverall,2))) +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of All Diverted flights by flight type",
+       x = "Year",  
+       y = "Percentage of all diverted flights") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+```{r}
+# Small multiple
+ggplot(type_summary, aes(fill=type, y=DivertedPctWithin, x=Year)) + 
+    geom_bar(position="stack", stat="identity") +
+    scale_fill_viridis(discrete = T) +
+    labs(title = "Percentage of Diverted flights within each Flight Type",  
+       x = "Year",  
+       y = "Diverted Flights Percentage") +
+    theme(axis.text.x = element_text(angle = 90))
+```
+Similarly, almost all diverted planes are corporation type, other flight type has very little flights. However, of all type of flights, corporation flights are least prone to flight diversions. An indicator variable 'NotCorpo' was created to indicate flights that are not corporation type.
+```{r}
+flight_plane_airport <- flight_plane_airport %>%
+  mutate(Corpo = ifelse(type == 'Corporation', 1, 0))
+
+table(flight_plane_airport$Corpo)
+```
+To visualize the pairwise correlation between `Diverted` and other numeric variables, I will create a correlation plot of features for all years as follows: 
+```{r}
+# subset numeric features 
+numeric_features <- flight_plane_airport %>%
+    select(-c('DayOfWeek','UniqueCarrier','type','aircraft_type','engine_type','PlaneAgeCategory','MonthAbb','CarrierName','CRSDepTime','CRSArrTime','ArrDelay','DepDelay','CarrierDelay','WeatherDelay','NASDelay','SecurityDelay','LateAircraftDelay','DepTime.dt'))
+
+# Calculate correlation matrix
+corr_matrix <- cor(numeric_features)
+head(numeric_features)
+
+corrplot(corr_matrix, method = "color", type = "upper", 
+         addCoef.col = "black", # Add correlation coefficients in black color
+         tl.col = "black",tl.srt = 45,tl.cex = 0.8, # Text label color and rotation
+         number.cex = 0.5) # Adjust size of the numbers)
+```
+Based on the correlation matrix of all numerical features, no features exhibit a clear correlation with the target variable `Diverted`.
+
+```{r}
+# select subset of features
+flight_plane_airport.subset <- flight_plane_airport %>%
+  select(-c('Month','MonthAbb','DayofMonth','DayOfWeek','DepTime','TaxiIn','TaxiOut','TotalDelay','year','CRSDepTime','CRSArrTime','year','PlaneAge','ArrDelay','DepDelay','CarrierDelay','WeatherDelay','NASDelay','SecurityDelay','LateAircraftDelay','type','aircraft_type','engine_type','UniqueCarrier','DepTime.dt'))
+
+names(flight_plane_airport.subset)
+```
+
+### Logistic Regression
+
+To fit the logistic regression model, the data was split into training (80%) and testing (20%) sets for each year separately. Remaining missing values within continuous variables were imputed with their mean, and missing values within categorical variables are imputed with their mode. And then Factor variables (e.g. ‘UniqueCarrier’, ‘type’) were converted into dummy variables. Previously defined ordinal variable 'PlaneAgeCategory' were encoded as integer based on their level. The threshold for the positive class was adjusted to 0.004 based on the proportion of diverted flights. The model coefficients were plotted for each year to visualize the impact of different features on the probability of diversion. 
+
+Compute class weights
+```{r}
+# Compute class weights
+proportions <- proportions(table(flight_plane_airport.subset$Diverted))
+```
+
+The threshold for predicting positive class is set to 0.004 (based on the proportion of positive class).
+
+I created three specialized functions: 
+
+First function for training the model,  second for plotting the coefficients of the model, and last one for evaluating the model prediction.
+```{r}
+train_logreg <- function(task, row_ids){
+  # Function to train a logistic regression model with data preprocessing
+  # input: task object and row ids of data for training
+  # returns a trained graph leaner model, and coef() object from logistic regression 
+  
+  # Define pipe objects to impute missing values
+  imputer_factor <- po("imputemode", id = "imputemode_factor", affect_columns = selector_type("factor"))
+  imputer_ordered <- po("imputemode", id = "imputemode_ordered", affect_columns = selector_type("ordered"))
+  imputer_numeric <- po("imputemean", id = "imputemean_numeric", affect_columns = selector_type("numeric"))
+  
+  # Define pipe objects to encode factors and ordinal variables
+  fencoder <- po("encode", method = "treatment", affect_columns = selector_type("factor"))
+  ord_to_int <- po("colapply", applicator = as.integer, affect_columns = selector_type("ordered"))
+    
+  # Define learner and regularization parameter to tune
+  log_reg_lrn <- lrn('classif.log_reg', predict_type = 'prob')
+  
+  # Define graph learner
+  log_reg_grph <- 
+    imputer_factor %>>% 
+    imputer_ordered %>>%
+    imputer_numeric %>>%
+    fencoder %>>% 
+    ord_to_int %>>% 
+    po(log_reg_lrn) 
+  log_reg_grph <- GraphLearner$new(log_reg_grph)
+
+   # Train logistic regression model
+  log_reg_grph$train(task = task, row_ids = row_ids)
+  
+  return(
+    list(model = log_reg_grph, 
+         coef = coef(log_reg_grph$model$classif.log_reg$model))
+         )
+}
+
+plot_coef <- function(coef, year){
+  # Function to plot the coefficients of the model given a coef() object
+  # year specifies the year of the data of the fitted model, used in the title of the plot
+  
+  # Convert coef object to data frame
+  variables <- names(coef)
+  coef_df <- data.frame(Variable = variables, 
+                                 Coef = as.numeric(coef))
+  
+  # Plot the coefficients
+  coef_plot <- ggplot(coef_df, aes(x = reorder(Variable, -Coef), y = Coef)) +
+    geom_bar(stat = 'identity', position = 'dodge') +
+    labs(title = paste('Model Coefficients for year', year), x = 'Feature', y = 'Coefficient') +
+    theme(
+      axis.text.x = element_text(size = 9, angle = 90, hjust = 1),  # Increase font size for x-axis labels
+      axis.text.y = element_text(size = 9)  # Increase font size for y-axis labels
+    ) +
+    coord_flip()
+  
+  plot(coef_plot)
+}
+
+eval_model <- function(prediction, threshold, year) {
+  # function to evaluate predictions of a logistic regression model.
+  # threshold parameter specifies the threshold of classifying a positive class.
+  # year parameter specifies the year of the data of the fitted model, used in the title of the plot
+  
+  # set threshold for positive class
+  prediction$set_threshold(threshold)
+  
+  # Evaluate the model
+  performance <- prediction$score(msrs(c("classif.sensitivity","classif.specificity", "classif.precision", "classif.recall")))
+  
+  # Print performance metrics
+  cat("\nModel Performance for year", year, '\n')
+  print(performance)
+}
+
+```
+
+I will now use the functions from the previous part and perform machine learning operations for each year of the data separately. Additionally, ROC curve data of the model would be stored for each iteration, and be used in the ROC curve plot next part.
+```{r}
+# Convert target variable to factor
+flight_plane_airport.subset$Diverted <- as.factor(flight_plane_airport.subset$Diverted)
+
+# Create an empty data frame to collect ROC data across years
+roc_data_all <- data.frame()
+
+for (i in unique(flight_plane_airport.subset$Year)) {
+  # Subset data to include specified year only
+  year_subset <- flight_plane_airport.subset[flight_plane_airport.subset$Year == i, ] %>% 
+    select(-Year)
+  
+  # Define task
+  task <- TaskClassif$new(id = 'classif_task', 
+                          backend = year_subset, 
+                          target = 'Diverted',
+                          positive = "1")
+  
+  # Split data to training and testing partition
+  set.seed(1)
+  splits <- partition(task = task, ratio = 0.8)
+  
+   # Train logistic regression model
+  trained_model <- train_logreg(task = task, row_ids = splits$train)
+
+  # Extract coefficients
+  logistic_coef <- trained_model$coef
+  
+  # Plot coefficients
+  plot_coef(coef = logistic_coef, year = i)
+
+  # Make predictions on the test set
+  prediction <- trained_model$model$predict(task, row_ids = splits$test)
+  
+  # evaluate predictions for year i
+  eval_model(prediction = prediction,
+             threshold = 0.004,
+             year = i)
+  
+  # Compute the ROC curve using pROC
+  roc_obj <- roc(response = prediction$truth, 
+                 predictor = prediction$prob[, "1"], 
+                 levels = c("0", "1"))
+  
+  # Compute AUC for this year's model
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  # Create a data frame for this year's ROC curve
+  roc_df <- data.frame(
+    Year = i,
+    FPR = 1 - roc_obj$specificities,  # False Positive Rate = 1 - Specificity
+    TPR = roc_obj$sensitivities,         # True Positive Rate (Sensitivity)
+    AUC = auc_val
+  )
+  
+  # Append this ROC data to the overall data frame
+  roc_data_all <- rbind(roc_data_all, roc_df)
+}
+```
+
+ROC curves and AUC of each model.
+```{r}
+# Create a new label that includes the year and the AUC value
+roc_data_all <- roc_data_all %>%
+  mutate(Year_label = paste0(Year, " (AUC=", round(AUC, 2), ")"))
+
+# Final plot: ROC curves for all years together with AUC in the legend
+ggplot(roc_data_all, aes(x = FPR, y = TPR, color = Year_label, group = Year)) +
+  geom_line(size = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+  labs(title = "ROC Curves for Models by Year", 
+       x = "False Positive Rate", 
+       y = "True Positive Rate", 
+       color = "Year (AUC)") +
+  theme_minimal()
+```
+
