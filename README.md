@@ -1,2 +1,2 @@
 # GradDip-Datascience
-My completed courseworks in UoL
+Some of my completed courseworks in UoL
